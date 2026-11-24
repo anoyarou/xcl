@@ -2562,7 +2562,7 @@ impl Em {
     /// [11:0] names (XCL shader ABI).
     fn sampler_ref(&mut self, pc: u64, comparison: bool, s3: &str) -> String {
         let Some(&w) = self.static_ss.get(&pc) else {
-            return format!("SamplerDescriptorHeap[{}]", self.heap_index(&format!("{s3} & 0xFFFu")));
+            return format!("SamplerDescriptorHeap[{}]", self.heap_index(&format!("{s3} & 0x7FFu")));
         };
         let i = match self.static_used.iter().position(|&x| x == (w, comparison)) {
             Some(i) => i,
@@ -3114,8 +3114,13 @@ impl Em {
         let t = self.t();
         let tw0 = self.sreg(srsrc);
         let tw1 = self.sreg(srsrc + 1);
+        let tw3 = self.sreg(srsrc + 3);
         let act = self.act();
         let ps = matches!(self.opt.mode, Mode::Pixel(_));
+        // Guard against null / unpatched / OOB T# descriptors so AMD Tier-3 GPUs never page-fault
+        // indexing `ResourceDescriptorHeap` (valid XCL T#: type >= 8, BASE_ADDRESS_HI cleared,
+        // SRV index < (1 << 21) - 1 so `tw0 + 1` stays in bounds without wrapping).
+        self.line(&format!("bool {t}_ok = (({tw3} >> 28) >= 8u) && ((({tw1}) & 0xFFu) == 0u) && (({tw0}) < 2097151u);"));
         let comps: Vec<u64> = (0..4).filter(|c| dmask >> c & 1 == 1).collect();
         // write the selected result components (`r` is a uint4 of raw bits); D16 packs halves
         let write_result = |s: &mut Self, r: &str, n: usize, sel: &dyn Fn(usize) -> u64, half: &dyn Fn(&str) -> String| {
@@ -3199,8 +3204,18 @@ impl Em {
                 return Err("MIMG unorm");
             }
             let samp = if has_c { "SamplerComparisonState" } else { "SamplerState" };
-            let idx = self.heap_index(&tw0);
-            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[{idx}];"));
+            let gather = base.starts_with("gather4");
+            let implicit_lod = ps && !gather && !has_lz && grads.is_none() && lod.is_none();
+            let idx = if implicit_lod {
+                self.line(&format!("uint {t}_tw0 = select({t}_ok, {tw0}, 0u);"));
+                format!("{t}_tw0")
+            } else {
+                self.line(&format!("uint4 {t}_r = uint4(0u, 0u, 0u, 0u);"));
+                self.line(&format!("if (and({act}, {t}_ok)) {{"));
+                tw0.clone()
+            };
+            let hidx = self.heap_index(&idx);
+            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[{hidx}];"));
             let sampler = self.sampler_ref(d.pc, has_c, &s3);
             self.line(&format!("{samp} {t}_S = {sampler};"));
             if let Some(o) = &offset {
@@ -3212,7 +3227,6 @@ impl Em {
                 };
                 self.texel_offset(&t, dim, o, &level, "");
             }
-            let gather = base.starts_with("gather4");
             let call = if gather {
                 if comps.len() != 1 {
                     return Err("gather4 dmask");
@@ -3280,7 +3294,11 @@ impl Em {
                     _ => format!("{t}_T.Sample({t}_S, {})", tail(coord.clone())),
                 }
             };
-            self.line(&format!("uint4 {t}_r = asuint({call});"));
+            if implicit_lod {
+                self.line(&format!("uint4 {t}_r = ({t}_ok ? asuint({call}) : uint4(0u, 0u, 0u, 0u));"));
+            } else {
+                self.line(&format!("{t}_r = asuint({call}); }}"));
+            }
             let n = if gather { 4 } else { comps.len() };
             let comps2 = comps.clone();
             let sel = move |k: usize| if gather { k as u64 } else { comps2[k] };
@@ -3304,12 +3322,13 @@ impl Em {
                 _ => return Err("MIMG dim"),
             };
             let s3 = self.sreg(ssamp + 3);
-            let idx = self.heap_index(&tw0);
+            self.line(&format!("uint {t}_tw0 = select({t}_ok, {tw0}, 0u);"));
+            let idx = self.heap_index(&format!("{t}_tw0"));
             self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[{idx}];"));
             let sampler = self.sampler_ref(d.pc, false, &s3);
             self.line(&format!("SamplerState {t}_S = {sampler};"));
             self.line(&format!(
-                "uint4 {t}_r = asuint(float4({t}_T.CalculateLevelOfDetail({t}_S, {coord}), {t}_T.CalculateLevelOfDetailUnclamped({t}_S, {coord}), 0.0f, 0.0f));"
+                "uint4 {t}_r = ({t}_ok ? asuint(float4({t}_T.CalculateLevelOfDetail({t}_S, {coord}), {t}_T.CalculateLevelOfDetailUnclamped({t}_S, {coord}), 0.0f, 0.0f)) : uint4(0u, 0u, 0u, 0u));"
             ));
             let comps2 = comps.clone();
             write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &f16);
@@ -3329,9 +3348,8 @@ impl Em {
                 _ => return Err("get_resinfo dim"),
             };
             let idx = self.heap_index(&tw0);
-            self.line(&format!("{ty}<float4> {t}_T = ResourceDescriptorHeap[{idx}];"));
-            self.line(&format!("uint {t}_w, {t}_h, {t}_d, {t}_n; {call}"));
-            self.line(&format!("uint4 {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n);"));
+            self.line(&format!("uint4 {t}_r = uint4(0u, 0u, 0u, 0u);"));
+            self.line(&format!("if (and({act}, {t}_ok)) {{ {ty}<float4> {t}_T = ResourceDescriptorHeap[{idx}]; uint {t}_w, {t}_h, {t}_d, {t}_n; {call} {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n); }}"));
             let comps2 = comps.clone();
             write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &|e: &str| e.to_string());
             return Ok(());
@@ -3355,12 +3373,12 @@ impl Em {
         self.line(&format!("uint {t}_cls = img_cls(({tw1} >> 20) & 0x1FFu);"));
         match base {
             "load" | "load_mip" => {
-                self.line(&format!("uint4 {t}_r;"));
+                self.line(&format!("uint4 {t}_r = uint4(0u, 0u, 0u, 0u);"));
                 let ld = if dim == 6 { format!("{t}_T.Load({icoord}, {})", ic.get(2).cloned().unwrap_or("0u".into())) } else { format!("{t}_T.Load({load_arg})") };
                 let idx = self.heap_index(&tw0);
                 let tex = |vt: &str| format!("Texture{rty}<{vt}4> {t}_T = ResourceDescriptorHeap[{idx}];");
                 self.line(&format!(
-                    "if ({t}_cls == 1u) {{ {} {t}_r = {ld}; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({ld}); }} else {{ {} {t}_r = asuint({ld}); }}",
+                    "if (and({act}, {t}_ok)) {{ if ({t}_cls == 1u) {{ {} {t}_r = {ld}; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({ld}); }} else {{ {} {t}_r = asuint({ld}); }} }}",
                     tex("uint"),
                     tex("int"),
                     tex("float")
@@ -3390,7 +3408,7 @@ impl Em {
                 let idx = self.heap_index(&format!("{tw0} + 1u"));
                 let uav = |vt: &str| format!("RWTexture{rty}<{vt}4> {t}_U = ResourceDescriptorHeap[{idx}];");
                 self.line(&format!(
-                    "if ({act}) {{ if ({t}_cls == 1u) {{ {} {t}_U[{icoord}] = {v4}; }} else if ({t}_cls == 2u) {{ {} {t}_U[{icoord}] = (int4){v4}; }} else {{ {} {t}_U[{icoord}] = asfloat({v4}); }} }}",
+                    "if (and({act}, {t}_ok)) {{ if ({t}_cls == 1u) {{ {} {t}_U[{icoord}] = {v4}; }} else if ({t}_cls == 2u) {{ {} {t}_U[{icoord}] = (int4){v4}; }} else {{ {} {t}_U[{icoord}] = asfloat({v4}); }} }}",
                     uav("uint"),
                     uav("int"),
                     uav("float")
@@ -3400,10 +3418,9 @@ impl Em {
                 // the operations without an int view: on the uint texel (CAS loops where needed)
                 let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
                 let idx = self.heap_index(&format!("{tw0} + 1u"));
-                self.line(&format!("RWTexture{rty}<uint> {t}_U = ResourceDescriptorHeap[{idx}];"));
                 self.line(&format!("uint {t}_old = 0u;"));
                 let body = rmw32(&base[7..], &At::Ref(format!("{t}_U[{icoord}]")), &v, &cmp, &format!("{t}_old"), &t).ok_or("image_atomic")?;
-                self.line(&format!("if ({act}) {{ {body} }}"));
+                self.line(&format!("if (and({act}, {t}_ok)) {{ RWTexture{rty}<uint> {t}_U = ResourceDescriptorHeap[{idx}]; {body} }}"));
                 if f("GLC") == 1 {
                     self.line(&format!("if ({act}) {v} = {t}_old;"));
                 }
@@ -3424,9 +3441,8 @@ impl Em {
                 let vt = if signed { "int" } else { "uint" };
                 let val = if signed { format!("(int){v}") } else { v.clone() };
                 let idx = self.heap_index(&format!("{tw0} + 1u"));
-                self.line(&format!("RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[{idx}];"));
                 self.line(&format!("{vt} {t}_old = 0;"));
-                self.line(&format!("if ({act}) {{ {op}({t}_U[{icoord}], {val}, {t}_old); }}"));
+                self.line(&format!("if (and({act}, {t}_ok)) {{ RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[{idx}]; {op}({t}_U[{icoord}], {val}, {t}_old); }}"));
                 if f("GLC") == 1 {
                     self.line(&format!("if ({act}) {v} = (uint){t}_old;"));
                 }
@@ -4010,26 +4026,31 @@ impl Em {
                 self.write_mask(&dst, &cond);
                 return Ok(());
             }
-            let (a, b) = match ty {
-                "u64" => (u64v(0), u64v(1)),
-                "i64" => (format!("(int64_t){}", u64v(0)), format!("(int64_t){}", u64v(1))),
-                "f64" => (f64v(0), f64v(1)),
-                _ => return Err("VOPC 64"),
-            };
-            let cond = if ty == "f64" {
-                float_compare(op, &a, &b, "isnan_d").ok_or("VOPC 64")?
-            } else {
-                match op {
-                    "f" => "false".to_string(),
-                    "lt" => format!("{a} < {b}"),
-                    "eq" => format!("{a} == {b}"),
-                    "le" => format!("{a} <= {b}"),
-                    "gt" => format!("{a} > {b}"),
-                    "ne" | "lg" => format!("{a} != {b}"),
-                    "ge" => format!("{a} >= {b}"),
-                    "t" | "tru" => "true".to_string(),
-                    _ => return Err("VOPC 64"),
+            let cond = match ty {
+                "f64" => float_compare(op, &f64v(0), &f64v(1), "isnan_d").ok_or("VOPC 64")?,
+                "u64" | "i64" => {
+                    // Lower 64-bit integer comparisons as 32-bit high/low dword comparisons so
+                    // DXC never emits `icmp i64` (miscompiled by AMD's D3D12 compiler on RDNA
+                    // when operands share a register/dword, e.g. `v[1:2]` vs `v[2:3]`).
+                    let ((al, ah), (bl, bh)) = (&lo_hi[0], &lo_hi[1]);
+                    let (ha, hb) = if ty == "i64" {
+                        (format!("(int)({ah})"), format!("(int)({bh})"))
+                    } else {
+                        (ah.clone(), bh.clone())
+                    };
+                    match op {
+                        "f" => "false".to_string(),
+                        "t" | "tru" => "true".to_string(),
+                        "eq" => format!("(({ah}) == ({bh}) && ({al}) == ({bl}))"),
+                        "ne" | "lg" => format!("(({ah}) != ({bh}) || ({al}) != ({bl}))"),
+                        "lt" => format!("({ha} < {hb} || (({ah}) == ({bh}) && ({al}) < ({bl})))"),
+                        "le" => format!("({ha} < {hb} || (({ah}) == ({bh}) && ({al}) <= ({bl})))"),
+                        "gt" => format!("({ha} > {hb} || (({ah}) == ({bh}) && ({al}) > ({bl})))"),
+                        "ge" => format!("({ha} > {hb} || (({ah}) == ({bh}) && ({al}) >= ({bl})))"),
+                        _ => return Err("VOPC 64"),
+                    }
                 }
+                _ => return Err("VOPC 64"),
             };
             let dst = if name.starts_with("v_cmpx_") { Dst::S(126) } else { dst };
             self.write_mask(&dst, &cond);
@@ -4046,12 +4067,13 @@ impl Em {
                     format!("(uint64_t)((int64_t)(int){} * (int64_t)(int){})", lo_hi[0].0, lo_hi[1].0)
                 };
                 self.line(&format!("uint64_t {t}_p = {p}; uint64_t {t}_c = {};", u64v(2)));
-                self.line(&format!("uint64_t {t}_w = {t}_p + {t}_c;"));
+                self.line(&format!("uint64_t {t}_w = {t}_p + {t}_c; uint {t}_wl = (uint){t}_w, {t}_wh = (uint)({t}_w >> 32);"));
+                let (cl, ch) = (&lo_hi[2].0, &lo_hi[2].1);
                 let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
                 if !matches!(sdst, Dst::Null) && !self.program_opt.is_dead_carry_sdst(d.pc) {
-                    self.write_mask(&sdst, &format!("{t}_w < {t}_c"));
+                    self.write_mask(&sdst, &format!("({t}_wh < ({ch}) || ({t}_wh == ({ch}) && {t}_wl < ({cl})))"));
                 }
-                self.write64(&dst, &format!("(uint){t}_w"), &format!("(uint)({t}_w >> 32)"));
+                self.write64(&dst, &format!("{t}_wl"), &format!("{t}_wh"));
                 return Ok(());
             }
             _ => {
