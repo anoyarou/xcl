@@ -3515,6 +3515,14 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         driver_cache::note(true, None);
     }
     if hr < 0 {
+        // in the log itself, not only through note_translation_error's first 40 reasons (a
+        // retail game's mesh warnings use them up early): a big program the driver gives up on
+        // after a minute (E_OUTOFMEMORY at the commit limit) was not seen at all
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: the driver rejected a compute PSO ({hr:#x}): {} B DXIL, {} ms in the driver ({} so far)", dxil.len(), started.elapsed().as_millis(), n + 1);
+        }
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
         return Some(Err(()));
     }
@@ -4546,7 +4554,9 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
     let d = dummy();
-    let mesh = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
+    let has_25 = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32 || s.0 == 25));
+    let has_24 = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == 24));
+    let mesh = has_25 || has_24;
     let dm = if mesh { Some(dummy_mesh()?) } else { None };
     let mut off = 0usize;
     while off + 8 <= size {
@@ -4565,8 +4575,26 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
             1 => put(&mut buf, &d.vs),
             2 => put(&mut buf, dm.map_or(&d.ps[..], |m| &m.1[..])),
             6 => put(&mut buf, &d.cs),
-            3 | 4 | 5 | 24 => put(&mut buf, &[]),
-            25 => put(&mut buf, &dm?.0),
+            3 | 4 | 5 => put(&mut buf, &[]),
+            24 => {
+                if has_25 {
+                    put(&mut buf, &[]);
+                } else {
+                    buf[off..off + 4].copy_from_slice(&(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).to_le_bytes());
+                    if let Some(m) = dm {
+                        put(&mut buf, &m.0);
+                    } else {
+                        put(&mut buf, &[]);
+                    }
+                }
+            }
+            25 => {
+                if let Some(m) = dm {
+                    put(&mut buf, &m.0);
+                } else {
+                    put(&mut buf, &[]);
+                }
+            }
             12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
             7 => buf[at..at + 32].fill(0),        // stream output
             _ => {}
