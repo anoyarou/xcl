@@ -203,6 +203,8 @@ fn scalar_bfe_64_handles_unsigned_signed_and_zero_width() {
 fn scalar_bitcmp_64_selects_the_indexed_half() {
     let code = prog(&[
         ("S_BITCMP1_B64", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 8)], None),
+        // Consume the first scc before the second bitcmp overwrites it so dead-scc elision keeps both.
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 129), ("SSRC1", 128)], None),
         ("S_BITCMP0_B64", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 9)], None),
     ]);
     let t = translate(&code, &Options::default()).unwrap();
@@ -5833,7 +5835,8 @@ fn gpu_split_wave64_lane_local_masks() {
     ]);
     if runner::split_wave64() {
         let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
-        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 4, "every mask stays in its half");
+        // 3 live local masks (2 v_cmp + v_add_co carry-in); v_add_co_ci's dead carry-out elides its ballot.
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 3, "every live mask stays in its half");
         assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 0);
     }
     let mut st = KernelState::default();
@@ -5947,11 +5950,11 @@ fn gpu_split_wave64_masks_read_whole_after_partial_writes() {
         }
     }
     if runner::split_wave64() {
-        // v_cmp into NULL: nothing to exchange
+        // v_cmp into NULL: nothing to exchange and dead carry/mask destination elides the ballot
         let code = prog(&[("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 125), ("SRC0", V), ("SRC1", V + 1)], None)]);
         let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
         assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 0);
-        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 1);
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 0);
     }
 }
 
@@ -6016,7 +6019,8 @@ fn gpu_split_wave64_local_and_exchanged_masks_in_diverging_waves() {
         assert!(t.complete(), "{:?}", t.unsupported_why);
         if runner::split_wave64() {
             assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 1, "the v_cmp: read whole by the odd waves");
-            assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 2, "the carries");
+            // 1 live carry (v_add_co -> v_add_co_ci); the final dead carry-out elides its ballot.
+            assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 1, "the live carry");
         }
         let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
         let base = 0x100usize;
