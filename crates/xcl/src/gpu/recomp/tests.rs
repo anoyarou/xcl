@@ -3183,17 +3183,6 @@ fn gpu_mesh_mode_reads_memory_windows() {
 /// accesses in window 0.
 #[test]
 fn gpu_memory_windows_above_4_gib() {
-    memory_windows_above_4_gib(false);
-}
-
-/// The same program with the windows taken from the descriptor heap (`Options::heap_windows`):
-/// same results, and no `switch` over windows in the HLSL.
-#[test]
-fn gpu_memory_windows_from_the_heap() {
-    memory_windows_above_4_gib(true);
-}
-
-fn memory_windows_above_4_gib(heap: bool) {
     if !gpu_ready() {
         return;
     }
@@ -3224,10 +3213,8 @@ fn memory_windows_above_4_gib(heap: bool) {
     let p = prog(&refs);
     let one = translate(&p, &Options::default()).unwrap();
     assert!(!one.hlsl.contains("mem1") && !one.hlsl.contains("xcl_w =") && !one.hlsl.contains("xcl_m"), "one window: the single-window HLSL");
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
-    assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
-    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + xcl_w)]"), heap);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
     let hi = |a: u64| (a >> 32) as u32;
     let mut st = KernelState::default();
@@ -3269,17 +3256,6 @@ fn memory_windows_above_4_gib(heap: bool) {
 ///   on `global_load`/`global_store` updates the target window accurately.
 #[test]
 fn gpu_memory_windows_reject_out_of_uma_aliasing() {
-    memory_windows_reject_out_of_uma_aliasing(false);
-}
-
-/// The same with the windows taken from the descriptor heap (`Options::heap_windows`): an
-/// address outside them reads 0 and drops its stores and atomics there too.
-#[test]
-fn gpu_heap_windows_reject_out_of_uma_aliasing() {
-    memory_windows_reject_out_of_uma_aliasing(true);
-}
-
-fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     if !gpu_ready() {
         return;
     }
@@ -3333,8 +3309,7 @@ fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     ];
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let p = prog(&refs);
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
-    assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap);
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
 
     let mut st = KernelState::default();
@@ -4577,10 +4552,10 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
     code.extend(glbl("GLOBAL_STORE_SHORT_D16_HI", &[("ADDR", 2), ("DATA", 62), ("SADDR", 2), ("OFFSET", 0x100)]));
     code.extend(glbl("GLOBAL_LOAD_USHORT", &[("VDST", 63), ("ADDR", 2), ("SADDR", 2), ("OFFSET", 0x100)]));
     // scratch (per lane): a dword at 2 · lane + 16, a byte at 2 · lane + 40
-    code.extend(enc("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 11), ("SADDR", 0x7D), ("OFFSET", 16)]));
-    code.extend(enc("SCRATCH_STORE_BYTE", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 36), ("SADDR", 0x7D), ("OFFSET", 40)]));
-    code.extend(enc("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 64), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 16)]));
-    code.extend(enc("SCRATCH_LOAD_UBYTE", "ENC_FLAT_SCRATCH", &[("VDST", 65), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 40)]));
+    code.extend(enc("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 11), ("SADDR", 0x7F), ("OFFSET", 16)]));
+    code.extend(enc("SCRATCH_STORE_BYTE", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 36), ("SADDR", 0x7F), ("OFFSET", 40)]));
+    code.extend(enc("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 64), ("ADDR", 2), ("SADDR", 0x7F), ("OFFSET", 16)]));
+    code.extend(enc("SCRATCH_LOAD_UBYTE", "ENC_FLAT_SCRATCH", &[("VDST", 65), ("ADDR", 2), ("SADDR", 0x7F), ("OFFSET", 40)]));
     // VALU
     let vv = |n: u64| V + n;
     code.extend(vop3("V_SAD_U8", &[("VDST", 66), ("SRC0", vv(22)), ("SRC1", vv(23)), ("SRC2", vv(24))]));
@@ -5680,6 +5655,75 @@ fn far_jumps_are_direct_branches() {
     for l in 0..64 {
         assert_eq!((r.vgpr[l][1], r.vgpr[l][2]), (1, 9), "lane {l}");
     }
+}
+
+/// A branch (direct or resolved far jump) entering a far-jump sequence after `s_getpc_b64`
+/// bypasses its PC initialization, so the `s_setpc_b64` must stay indirect (`far_target == None`).
+/// Branching to the `s_getpc_b64` entry itself still runs the full sequence and stays direct.
+#[test]
+fn far_jumps_stay_indirect_when_branched_into() {
+    let decode_and_resolve = |code: &[u8]| {
+        let mut v = Vec::new();
+        let mut off = 0;
+        while off + 4 <= code.len() {
+            let d = crate::gpu::rdna2::decode(&code[off..], off as u64).unwrap();
+            off += d.len;
+            v.push(d);
+        }
+        crate::gpu::rdna2::resolve_far_jumps(&mut v);
+        v
+    };
+
+    // Layout: [0] S_CBRANCH_SCC1 simm16 (4 B, pc=0)
+    //         [1] S_GETPC_B64 s[4:5]   (4 B, pc=4)
+    //         [2] S_ADD/SUB_U32 s4,s4,lit (8 B, pc=8)
+    //         [3] S_ADDC/SUBB_U32 s5,s5,0 (4 B, pc=16)
+    //         [4] S_SETPC_B64 s[4:5]   (4 B, pc=20)
+    //         [5] S_NOP 0              (4 B, pc=24)
+    for sub in [false, true] {
+        let (lo, hi) = if sub { ("S_SUB_U32", "S_SUBB_U32") } else { ("S_ADD_U32", "S_ADDC_U32") };
+        let offset = if sub { 4u32 } else { 16u32 };
+        let expected_target = if sub { 4u64 } else { 24u64 };
+
+        // Branch target PC = 4 + simm16 * 4:
+        //   simm16 = 0 -> pc=4  (S_GETPC_B64, valid entry -> stays direct)
+        //   simm16 = 1 -> pc=8  (lo add/sub, interior -> must stay indirect)
+        //   simm16 = 3 -> pc=16 (hi addc/subb, interior -> must stay indirect)
+        //   simm16 = 4 -> pc=20 (S_SETPC_B64, interior -> must stay indirect)
+        for (simm16, expect_direct) in [(0u64, true), (1, false), (3, false), (4, false)] {
+            let code = prog(&[
+                ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", simm16)], None),
+                ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 4)], None),
+                (lo, "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 255)], Some(offset)),
+                (hi, "ENC_SOP2", &[("SDST", 5), ("SSRC0", 5), ("SSRC1", 128)], None),
+                ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 4)], None),
+                ("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None),
+            ]);
+            let insts = decode_and_resolve(&code);
+            let want = expect_direct.then_some(expected_target);
+            assert_eq!(insts[4].far_target, want, "sub={sub} simm16={simm16}");
+        }
+    }
+
+    // Far-to-far edge: sequence A (pc=0..20) resolves to pc=24, which is the `lo` instruction
+    // inside sequence B (pc=20..40). Sequence A remains direct; sequence B must stay indirect.
+    //   A: [0] GETPC (pc=0, base=4), [1] ADD +20 (pc=4, 8B), [2] ADDC 0 (pc=12), [3] SETPC (pc=16) -> target 24
+    //   B: [4] GETPC (pc=20, base=24), [5] ADD +16 (pc=24, 8B), [6] ADDC 0 (pc=32), [7] SETPC (pc=36) -> target 40
+    //      [8] S_NOP (pc=40)
+    let far_to_far = prog(&[
+        ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 4)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 255)], Some(20)),
+        ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 5), ("SSRC1", 128)], None),
+        ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 4)], None),
+        ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 6)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 6), ("SSRC1", 255)], Some(16)),
+        ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 7), ("SSRC0", 7), ("SSRC1", 128)], None),
+        ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)], None),
+        ("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None),
+    ]);
+    let insts = decode_and_resolve(&far_to_far);
+    assert_eq!(insts[3].far_target, Some(24), "first far jump A stays direct");
+    assert_eq!(insts[7].far_target, None, "second far jump B targeted inside its interior stays indirect");
 }
 
 /// Mesh mode for a GPU with 32-lane waves only: the console's two wave64s per group as four

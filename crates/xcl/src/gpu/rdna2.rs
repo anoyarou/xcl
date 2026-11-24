@@ -518,9 +518,26 @@ fn scalar_int(d: &Decoded, code: u64) -> Option<u32> {
 /// (`far_target`), so it is an unconditional branch like `s_branch` to everything that
 /// follows the control flow. Any other `s_setpc_b64` stays an indirect jump.
 pub fn resolve_far_jumps(insts: &mut [Decoded]) {
+    use std::collections::HashSet;
+
+    for d in insts.iter_mut() {
+        d.far_target = None;
+    }
+
+    // Collect every direct branch target before annotating far jumps, plus prospective far-jump
+    // targets so a far jump entering another sequence after `s_getpc_b64` also keeps it indirect.
+    let mut targets: HashSet<u64> = insts.iter().filter_map(branch_target).collect();
+    let mut candidates: Vec<(usize, u64)> = Vec::new();
+
     for k in 3..insts.len() {
         let [get, lo, hi, set] = &insts[k - 3..=k] else { continue };
         if get.inst.name != "S_GETPC_B64" || set.inst.name != "S_SETPC_B64" {
+            continue;
+        }
+        if get.pc + get.len as u64 != lo.pc
+            || lo.pc + lo.len as u64 != hi.pc
+            || hi.pc + hi.len as u64 != set.pc
+        {
             continue;
         }
         let sub = match (lo.inst.name, hi.inst.name) {
@@ -547,7 +564,20 @@ pub fn resolve_far_jumps(insts: &mut [Decoded]) {
         let (Some(l), Some(h)) = (half(lo, r), half(hi, r + 1)) else { continue };
         let offset = (h as u64) << 32 | l as u64;
         let base = get.pc + get.len as u64;
-        insts[k].far_target = Some(if sub { base.wrapping_sub(offset) } else { base.wrapping_add(offset) });
+        let target = if sub { base.wrapping_sub(offset) } else { base.wrapping_add(offset) };
+        targets.insert(target);
+        candidates.push((k, target));
+    }
+
+    for (k, target) in candidates {
+        // Any branch entering `lo`, `hi`, or `set` bypasses `s_getpc_b64`, so the jump depends on
+        // incoming SGPR state and must stay indirect.
+        if !targets.contains(&insts[k - 2].pc)
+            && !targets.contains(&insts[k - 1].pc)
+            && !targets.contains(&insts[k].pc)
+        {
+            insts[k].far_target = Some(target);
+        }
     }
 }
 
