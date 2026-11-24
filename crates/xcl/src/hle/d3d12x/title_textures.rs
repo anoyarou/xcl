@@ -815,7 +815,7 @@ fn content_hash(b: &[u8]) -> u64 {
 }
 
 /// staging bytes of one batch at most
-const BATCH_BYTES: usize = 256 << 20;
+const BATCH_BYTES: usize = 64 << 20;
 
 /// The uploads `todo`, in batches of up to `BATCH_BYTES` (one list and one wait each).
 unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {

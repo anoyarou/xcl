@@ -1995,14 +1995,18 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     // so write the RDNA2 BVH descriptor directly and skip forwarding the console VA to PC.
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE) {
         let va = v.Anonymous.RaytracingAccelerationStructure.Location;
-        let in_uma = va != 0 && crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
-        if in_uma {
-            let w = crate::gpu::desc::bvh_words(va, true);
+        let resolved = if va != 0 {
+            crate::hle::kernelx::mirrors::source(va as usize).map(|s| s as u64).unwrap_or(va)
+        } else {
+            0
+        };
+        if resolved != 0 {
+            let w = crate::gpu::desc::bvh_words(resolved, true);
             return super::console_heap::write(&slot, &[w[0], w[1], w[2], w[3], 0, 0, 0, 0]);
         }
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
-            crate::xlog_warn!("D3D12.X: CreateShaderResourceView(RAYTRACING_ACCELERATION_STRUCTURE) at {va:#x} is not in unified memory – writing empty BVH descriptor");
+            crate::xlog_warn!("D3D12.X: CreateShaderResourceView(RAYTRACING_ACCELERATION_STRUCTURE) has null location – writing empty BVH descriptor");
         }
         return super::console_heap::write(&slot, &[0; 8]);
     }

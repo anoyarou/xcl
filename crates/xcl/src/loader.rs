@@ -346,6 +346,26 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
         } else {
             *(peb().add(0x10) as *mut usize) = m.base;
         }
+        if m.name.eq_ignore_ascii_case("game_scarlett_master.exe") {
+            use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+            // 1. Neutralize watchdog thread entrypoint at RVA 0x2215a60 -> XOR EAX, EAX; RET (31 C0 C3)
+            let watchdog_thread = (m.base + 0x2215a60) as *mut u8;
+            let mut old = 0u32;
+            if VirtualProtect(watchdog_thread as *mut _, 3, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+                *watchdog_thread = 0x31;
+                *watchdog_thread.add(1) = 0xC0;
+                *watchdog_thread.add(2) = 0xC3;
+                VirtualProtect(watchdog_thread as *mut _, 3, old, &mut old);
+                crate::xlog_info!("Patched watchdog thread worker at {:#x} -> XOR EAX, EAX; RET", watchdog_thread as usize);
+            }
+            // 2. Neutralize internal watchdog timeout crash at RVA 0x23cf620 -> RET (C3)
+            let target = (m.base + 0x23cf620) as *mut u8;
+            if VirtualProtect(target as *mut _, 1, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+                *target = 0xC3; // RET
+                VirtualProtect(target as *mut _, 1, old, &mut old);
+                crate::xlog_info!("Patched watchdog timeout assert at {:#x} -> RET", target as usize);
+            }
+        }
         run_tls_callbacks(m, 1);
     }
     READY.store(true, Ordering::Release);

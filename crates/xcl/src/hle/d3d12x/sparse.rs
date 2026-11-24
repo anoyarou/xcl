@@ -1183,7 +1183,19 @@ impl State {
 pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
     let u = crate::gpu::uma::get()?;
     let (addr, rounded) = u.sparse_alloc(size, align)?;
-    if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
+    let mut p = VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE);
+    if p.is_null() {
+        for _ in 0..4 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            p = VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE);
+            if !p.is_null() {
+                break;
+            }
+        }
+    }
+    if p.is_null() {
+        let err = windows_sys::Win32::Foundation::GetLastError();
+        crate::xlog_error!("sparse::alloc: VirtualAlloc commit failed for {rounded:#x} bytes at {addr:#x} (win32 error {err})");
         u.sparse_release(addr);
         return None;
     }
@@ -1196,7 +1208,19 @@ pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
 pub unsafe fn alloc_in(window: usize, size: usize, align: usize) -> Option<(usize, usize)> {
     let u = crate::gpu::uma::get()?;
     let (addr, rounded) = u.sparse_alloc_in(window, size, align)?;
-    if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
+    let mut p = VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE);
+    if p.is_null() {
+        for _ in 0..4 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            p = VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE);
+            if !p.is_null() {
+                break;
+            }
+        }
+    }
+    if p.is_null() {
+        let err = windows_sys::Win32::Foundation::GetLastError();
+        crate::xlog_error!("sparse::alloc_in({window}): VirtualAlloc commit failed for {rounded:#x} bytes at {addr:#x} (win32 error {err})");
         u.sparse_release(addr);
         return None;
     }

@@ -1131,8 +1131,10 @@ impl QueueInner {
                     }
                     Entry::Refused { hr, req, file, fill } => {
                         if let Some(t) = &fill {
-                            // the destination gets solid blocks; the request still fails
-                            unsafe { bcpack_fill(&req, t) };
+                            // the destination gets solid blocks; soft success so asset streamer proceeds
+                            if unsafe { bcpack_fill(&req, t) } {
+                                continue;
+                            }
                         }
                         self.fail(hr, req, file.as_deref());
                         if since_status >= 0 {
