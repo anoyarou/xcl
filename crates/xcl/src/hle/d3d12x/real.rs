@@ -2454,7 +2454,9 @@ pub(super) unsafe extern "system" fn dev_create_command_list_x(this: *mut c_void
     let pc_pso = super::console_list::pc_pso(pso as *mut c_void) as usize;
     let hr = dev_create_command_list(this, mask, ty, alloc, pc_pso, riid, ppv);
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-        *ppv = super::console_list::create_with_allocator(*ppv, alloc as *mut c_void);
+        let pc = *ppv;
+        super::list_x::on_create(pc, alloc, pso, D3D12_COMMAND_LIST_TYPE(ty as i32));
+        *ppv = super::console_list::create_with_allocator(pc, alloc as *mut c_void);
     }
     hr
 }
@@ -5253,7 +5255,10 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
         return hr;
     }
     match stream_pipeline(desc) {
-        StreamPipeline::Graphics(d) => return graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv, true),
+        StreamPipeline::Graphics(d) => {
+            let desc_ptr = &*d as *const _ as *const c_void;
+            return super::device_x::create_graphics_pso_tracked(this, desc_ptr, riid, ppv, |t, d, r, p| graphics_pso(t, d, r, p, true));
+        }
         StreamPipeline::Compute(d) => return dev_create_compute_pso(this, &*d as *const _ as *const c_void, riid, ppv),
         StreamPipeline::Unknown => {}
     }
@@ -5682,6 +5687,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
     for &l in std::slice::from_raw_parts(lists, n as usize) {
         if let Some(pc) = super::console_list::pc_list(l) {
+            super::list_x::forward_console_list_writes(l, pc);
             mapped.push(pc);
         } else if !super::title_list::push_segments(l, &mut mapped) {
             mapped.push(l);

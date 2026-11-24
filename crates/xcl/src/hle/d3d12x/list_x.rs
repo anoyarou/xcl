@@ -1906,6 +1906,22 @@ pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_
     }
 }
 
+/// Forward any writes recorded on a console list wrapper to its underlying PC list.
+pub(super) fn forward_console_list_writes(console_list: *mut c_void, pc_list: *mut c_void) {
+    let mut g = LISTS.lock().unwrap();
+    let Some(m) = g.as_mut() else { return };
+    let (cpu_writes, write64_signals, sparse_writes) = if let Some(from) = m.get_mut(&(console_list as usize)) {
+        (std::mem::take(&mut from.cpu_writes), std::mem::take(&mut from.write64_signals), std::mem::take(&mut from.sparse_writes))
+    } else {
+        return;
+    };
+    if let Some(to) = m.get_mut(&(pc_list as usize)) {
+        to.cpu_writes.extend(cpu_writes);
+        to.write64_signals.extend(write64_signals);
+        to.sparse_writes.extend(sparse_writes);
+    }
+}
+
 /// After `lists` went to `queue`: their writes into memory the GPU does not see (`cpu_writes`).
 pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void]) {
     let writes: Vec<super::cpu_writes::Write> = {

@@ -96,12 +96,11 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
         real::dev_create_command_list_x(this, node, ty, alloc, pso, riid, ppv)
     } else {
         let resolved_pso = super::pso_async::resolve_for_bind(pso);
-        let hr = real::dev_create_command_list(this, node, ty, alloc, resolved_pso, riid, ppv);
-        if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-            super::list_x::on_create(*ppv, alloc, pso, D3D12_COMMAND_LIST_TYPE(ty as i32));
-        }
-        hr
+        real::dev_create_command_list(this, node, ty, alloc, resolved_pso, riid, ppv)
     };
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::list_x::on_create(*ppv, alloc, pso, D3D12_COMMAND_LIST_TYPE(ty as i32));
+    }
     if dma && hr >= 0 && !ppv.is_null() {
         real::readopt(*ppv, real::Kind::DmaList);
         if std::env::var_os("XCL_WATCH_DMA").is_some() {
