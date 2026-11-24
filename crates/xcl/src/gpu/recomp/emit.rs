@@ -7287,6 +7287,7 @@ mod opt_helper_tests {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::PRELUDE_MEM;
 
