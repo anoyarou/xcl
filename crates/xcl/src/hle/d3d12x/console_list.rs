@@ -390,7 +390,7 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     .unwrap_or(0);
     if left == 0 {
         if let Some(st) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&obj)) {
-            free_uma(&st.uma);
+            hold_until_reset(st.allocator, st.uma);
             let release: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(pc_vtable_call(st.pc, 2));
             release(st.pc);
         }
@@ -430,9 +430,7 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
         return crate::util::E_FAIL;
     };
     // what the previous recording left in unified memory lives until its allocator resets
-    if !blocks.is_empty() {
-        PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(old_alloc).or_default().extend(blocks);
-    }
+    hold_until_reset(old_alloc, blocks);
     with_list(obj, |st| new_chunk(obj, st));
     let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
     f(pc, allocator, pc_pso(pso))
@@ -1015,5 +1013,57 @@ mod tests {
         let l = layout_from_blob(&rts0(&[(1, 2), (2, 0), (0, 0)])).unwrap();
         let args: Vec<u8> = [1u32, 2, 0x5000, 4, 0x80].iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(user_data_gfx(&l, &args, 0x200), vec![0x200, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0x5000, 4, 0x80]);
+    }
+
+    #[test]
+    fn uma_blocks_are_held_until_allocator_reset_on_release() {
+        let dummy_allocator = 0xAA00_1100 as *mut c_void;
+        static RELEASE_CALLED: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn mock_release(_this: usize) -> u32 {
+            RELEASE_CALLED.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        let vtable = [0usize, 0usize, mock_release as usize];
+        let vtable_ptr = vtable.as_ptr();
+        let fake_pc = &vtable_ptr as *const *const usize as *mut c_void;
+
+        let cl = unsafe { create_with_allocator(fake_pc, dummy_allocator) };
+        assert!(!cl.is_null());
+
+        let dummy_blocks = vec![0x1000_usize, 0x2000_usize];
+        with_list(cl as usize, |st| {
+            st.uma.extend(dummy_blocks.iter().copied());
+        });
+
+        assert!(take_pending_for_test(dummy_allocator as usize).is_empty());
+
+        let addref_fn: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe {
+            let vt = *(cl as *const *const usize);
+            std::mem::transmute(*vt.add(1))
+        };
+        let release_fn: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe {
+            let vt = *(cl as *const *const usize);
+            std::mem::transmute(*vt.add(2))
+        };
+
+        // Add a reference: refcount becomes 2
+        assert_eq!(unsafe { addref_fn(cl) }, 2);
+
+        // First release: refcount drops to 1, blocks should not be released yet
+        assert_eq!(unsafe { release_fn(cl) }, 1);
+        assert_eq!(RELEASE_CALLED.load(Ordering::SeqCst), 0);
+        assert!(take_pending_for_test(dummy_allocator as usize).is_empty());
+
+        // Final release: refcount drops to 0, underlying PC list released, UMA blocks held
+        assert_eq!(unsafe { release_fn(cl) }, 0);
+        assert_eq!(RELEASE_CALLED.load(Ordering::SeqCst), 1);
+
+        // Verify UMA blocks are held in pending for the allocator
+        assert_eq!(take_pending_for_test(dummy_allocator as usize), dummy_blocks);
+
+        // Verify allocator_reset clears pending blocks
+        hold_until_reset(dummy_allocator as usize, dummy_blocks);
+        allocator_reset(dummy_allocator);
+        assert!(take_pending_for_test(dummy_allocator as usize).is_empty());
     }
 }
