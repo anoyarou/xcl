@@ -363,7 +363,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     let ps_debug = stage == Stage::Pixel
         && (debug_color(blob).is_some() || ["XCL_DEBUG_LOD0", "XCL_DEBUG_PS_SUB", "XCL_DEBUG_PS_EXPR"].iter().any(|v| std::env::var_os(v).is_some()));
     if stage != Stage::Compute && !ps_debug && crate::gpu::dxil::kernel::enabled_graphics() {
-        match direct_graphics(blob, stage, sampler_base, windows) {
+        match direct_graphics(blob, stage, sampler_base, windows, split_wave64) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated(if stage == Stage::Vertex { "VS" } else { "PS" });
                 return Ok(c);
@@ -558,7 +558,7 @@ fn cached_shader(
 }
 
 fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
-    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN"]
+    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_DXIL_NO_OPT"]
         .iter()
         .any(|name| present(name))
         && (stage != Stage::Pixel
@@ -648,14 +648,18 @@ fn dump_direct(blob: &[u8], dxil: &[u8]) {
 }
 
 /// A console vertex / pixel shader through the direct DXIL translator.
-fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -> Result<Compiled, String> {
+fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let want = if stage == Stage::Vertex { 4 } else { 5 };
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == want)).ok_or("no hardware variant")?;
     let mode = interface(blob, &sh, f).ok_or("unknown shader interface")?;
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: super::detect_wave64(code), split: false, mem_windows: windows, sampler_base };
+    let wave64 = super::detect_wave64(code);
+    if wave64 && split_wave64 && super::needs_upper_lanes(code) {
+        return Err("wave64 VS / PS in 32-lane waves needs upper-lane emulation".into());
+    }
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: false, mem_windows: windows, sampler_base };
     let k = match (&mode, stage) {
         (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs)?,
         (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps)?,
@@ -1179,7 +1183,7 @@ mod shader_cache_tests {
 
     #[test]
     fn shader_cache_bypasses_debug_overrides() {
-        for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN"] {
+        for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_DXIL_NO_OPT"] {
             assert!(!cache_allowed(Stage::Compute, |v| v == name));
             assert!(!cache_allowed(Stage::Vertex, |v| v == name));
             assert!(!cache_allowed(Stage::Pixel, |v| v == name));
