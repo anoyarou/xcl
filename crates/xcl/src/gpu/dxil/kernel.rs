@@ -35,7 +35,8 @@ pub struct KernelOptions {
 }
 
 /// Version of the direct translator's output, part of the on-disk translation cache's
-/// identity (`recomp::pso`): bump it on any change that alters the emitted containers
+/// identity (`recomp::pso`): bump it when `pso::direct_compute` / `direct_graphics` change the
+/// containers. An edit of `gpu/dxil` needs no bump, `XCL_DIRECT_DXIL_SOURCE_ID` is its hash
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
 pub const TRANSLATOR_VERSION: u32 = 8;
 
