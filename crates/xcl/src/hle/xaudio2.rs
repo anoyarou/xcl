@@ -30,7 +30,7 @@
 
 #![allow(non_snake_case)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -535,6 +535,7 @@ struct DecodedVoiceState {
     title_cb: usize,
     /// Maps stable token (`&*DecodedBuffer as usize`) → owned `DecodedBuffer`.
     live_buffers: Mutex<HashMap<usize, Box<DecodedBuffer>>>,
+    queue: Mutex<VecDeque<usize>>,
 }
 
 struct DecodedVoiceHandle {
@@ -613,6 +614,7 @@ unsafe extern "system" fn decoded_cb_buffer_end(this: *mut c_void, ctx: *mut c_v
     // Remove and drop the decoded PCM buffer before invoking the title's callback so
     // the lock is released and no double-free or deadlock can occur.
     let removed = cb.state.live_buffers.lock().unwrap().remove(&(ctx as usize));
+    cb.state.queue.lock().unwrap().retain(|&t| t != (ctx as usize));
     let orig = removed.as_ref().map(|b| b.orig_context as *mut c_void).unwrap_or(ctx);
     drop(removed);
     if let Some((obj, vt)) = title_cb_vtbl(cb.state.title_cb) {
@@ -668,6 +670,8 @@ static DECODED_CALLBACK_VTBL: VoiceCallbackVtbl = VoiceCallbackVtbl {
 static ORIGINALS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 /// Live silent voices (voice pointer → info).
 static XMA: Mutex<Option<HashMap<usize, XmaInfo>>> = Mutex::new(None);
+/// Live silent voice submitted context queues (voice pointer → context queue).
+static SILENT_QUEUES: Mutex<Option<HashMap<usize, VecDeque<usize>>>> = Mutex::new(None);
 /// Live decoded voices (Opus & XMA1/XMA2: voice pointer → handle).
 static DECODED_VOICES: Mutex<Option<HashMap<usize, DecodedVoiceHandle>>> = Mutex::new(None);
 /// Count of live decoded voices (fast path for plain PCM voices).
@@ -785,6 +789,7 @@ unsafe fn create_decoded_voice(
         avg_bytes,
         title_cb: cb as usize,
         live_buffers: Mutex::new(HashMap::new()),
+        queue: Mutex::new(VecDeque::new()),
     });
     let wrapped_cb = Box::into_raw(Box::new(DecodedCallback {
         vtbl: &DECODED_CALLBACK_VTBL,
@@ -1078,6 +1083,7 @@ unsafe fn submit_decoded_buffer(
     let boxed = Box::new(DecodedBuffer { orig_context: orig_buf.context as usize, _pcm: pcm_bytes });
     let token = &*boxed as *const DecodedBuffer as usize;
     state.live_buffers.lock().unwrap().insert(token, boxed);
+    state.queue.lock().unwrap().push_back(token);
 
     nb.audio_data = pcm_ptr;
     nb.audio_bytes = pcm_len;
@@ -1086,6 +1092,7 @@ unsafe fn submit_decoded_buffer(
     let hr = orig(this, &nb, std::ptr::null());
     if hr < 0 {
         state.live_buffers.lock().unwrap().remove(&token);
+        state.queue.lock().unwrap().retain(|&t| t != token);
     }
     hr
 }
@@ -1110,9 +1117,25 @@ unsafe extern "system" fn submit_source_buffer(this: *mut c_void, buf: *const XA
             if s.is_null() {
                 return E_FAIL;
             }
-            let nb = silent_buffer(&i, &buf.read_unaligned(), s, SILENCE_BYTES);
+            let b = buf.read_unaligned();
+            let nb = silent_buffer(&i, &b, s, SILENCE_BYTES);
             SILENCED.fetch_add(1, Ordering::Relaxed);
-            orig(this, &nb, std::ptr::null())
+            SILENT_QUEUES
+                .lock()
+                .unwrap()
+                .get_or_insert_with(HashMap::new)
+                .entry(this as usize)
+                .or_default()
+                .push_back(b.context as usize);
+            let hr = orig(this, &nb, std::ptr::null());
+            if hr < 0 {
+                if let Some(m) = SILENT_QUEUES.lock().unwrap().as_mut() {
+                    if let Some(q) = m.get_mut(&(this as usize)) {
+                        q.pop_back();
+                    }
+                }
+            }
+            hr
         }
         _ => orig(this, buf, wma),
     }
@@ -1122,14 +1145,22 @@ unsafe extern "system" fn flush_source_buffers(this: *mut c_void) -> HRESULT {
     let Some(orig) = original(this, VOICE_FLUSH_SOURCE_BUFFERS) else { return E_FAIL };
     let orig: FlushSourceBuffersFn = std::mem::transmute(orig);
     let hr = orig(this);
-    if hr >= 0 && DECODED_LIVE_COUNT.load(Ordering::Acquire) != 0 {
-        let state = DECODED_VOICES
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|m| m.get(&(this as usize)).map(|h| Arc::clone(&h.state)));
-        if let Some(state) = state {
-            state.decoder.lock().unwrap().flush();
+    if hr >= 0 {
+        if let Some(m) = SILENT_QUEUES.lock().unwrap().as_mut() {
+            if let Some(q) = m.get_mut(&(this as usize)) {
+                q.clear();
+            }
+        }
+        if DECODED_LIVE_COUNT.load(Ordering::Acquire) != 0 {
+            let state = DECODED_VOICES
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(&(this as usize)).map(|h| Arc::clone(&h.state)));
+            if let Some(state) = state {
+                state.decoder.lock().unwrap().flush();
+                state.queue.lock().unwrap().clear();
+            }
         }
     }
     hr
@@ -1139,17 +1170,38 @@ unsafe extern "system" fn get_state(this: *mut c_void, state_out: *mut XAudio2Vo
     let Some(orig) = original(this, VOICE_GET_STATE) else { return };
     let orig: GetStateFn = std::mem::transmute(orig);
     orig(this, state_out, flags);
-    if !state_out.is_null() && DECODED_LIVE_COUNT.load(Ordering::Acquire) != 0 {
-        let voice_state = DECODED_VOICES
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|m| m.get(&(this as usize)).map(|h| Arc::clone(&h.state)));
-        if let Some(voice_state) = voice_state {
-            let cur = (*state_out).current_buffer_context as usize;
-            if cur != 0 {
-                if let Some(buf) = voice_state.live_buffers.lock().unwrap().get(&cur) {
-                    (*state_out).current_buffer_context = buf.orig_context as *mut c_void;
+    if !state_out.is_null() {
+        if DECODED_LIVE_COUNT.load(Ordering::Acquire) != 0 {
+            let voice_state = DECODED_VOICES
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(&(this as usize)).map(|h| Arc::clone(&h.state)));
+            if let Some(voice_state) = voice_state {
+                let cur = (*state_out).current_buffer_context as usize;
+                if cur != 0 {
+                    if let Some(buf) = voice_state.live_buffers.lock().unwrap().get(&cur) {
+                        (*state_out).current_buffer_context = buf.orig_context as *mut c_void;
+                    }
+                } else if (*state_out).buffers_queued > 0 {
+                    // Under Proton/Wine (FAudio), pCurrentBufferContext stays NULL on newly
+                    // submitted buffers until the audio thread ticks. Recover the context
+                    // from the front of the queued decoded buffers.
+                    if let Some(&first) = voice_state.queue.lock().unwrap().front() {
+                        if let Some(buf) = voice_state.live_buffers.lock().unwrap().get(&first) {
+                            (*state_out).current_buffer_context = buf.orig_context as *mut c_void;
+                        }
+                    }
+                }
+                return;
+            }
+        }
+        if (*state_out).current_buffer_context.is_null() && (*state_out).buffers_queued > 0 {
+            if let Some(m) = SILENT_QUEUES.lock().unwrap().as_ref() {
+                if let Some(q) = m.get(&(this as usize)) {
+                    if let Some(&first) = q.front() {
+                        (*state_out).current_buffer_context = first as *mut c_void;
+                    }
                 }
             }
         }
@@ -1160,6 +1212,9 @@ unsafe extern "system" fn destroy_voice(this: *mut c_void) {
     let Some(orig) = original(this, VOICE_DESTROY) else { return };
     let orig: DestroyVoiceFn = std::mem::transmute(orig);
     if let Some(m) = XMA.lock().unwrap().as_mut() {
+        m.remove(&(this as usize));
+    }
+    if let Some(m) = SILENT_QUEUES.lock().unwrap().as_mut() {
         m.remove(&(this as usize));
     }
     let decoded_handle = if DECODED_LIVE_COUNT.load(Ordering::Acquire) != 0 {
@@ -1175,6 +1230,7 @@ unsafe extern "system" fn destroy_voice(this: *mut c_void) {
     orig(this);
     if let Some(h) = decoded_handle {
         h.state.live_buffers.lock().unwrap().clear();
+        h.state.queue.lock().unwrap().clear();
         drop(Box::from_raw(h.cb_ptr as *mut DecodedCallback));
     }
 }

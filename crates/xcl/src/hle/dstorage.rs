@@ -41,7 +41,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
-use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RESERVE};
 use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent};
 
 use crate::util::{HRESULT, S_OK};
@@ -806,6 +806,7 @@ fn writable(p: usize, n: usize) -> bool {
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, n)) {
         return true;
     }
+    let is_sparse = crate::gpu::uma::get().is_some_and(|u| u.is_sparse(p));
     let mut at = p;
     while at < end {
         let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -813,7 +814,19 @@ fn writable(p: usize, n: usize) -> bool {
             return false;
         }
         let rw = 0x04 | 0x08 | 0x40 | 0x80; // PAGE_READWRITE / WRITECOPY / EXECUTE_READWRITE / EXECUTE_WRITECOPY
-        if m.State != MEM_COMMIT || m.Protect & rw == 0 || m.Protect & 0x100 != 0 {
+        if m.State != MEM_COMMIT {
+            if is_sparse && m.State == MEM_RESERVE {
+                let region_end = m.BaseAddress as usize + m.RegionSize;
+                let to_commit = (region_end - at).min(end - at);
+                if unsafe { crate::hle::kernelx::commit_sparse(at, to_commit, 0x04) }.is_null() {
+                    return false;
+                }
+                at += to_commit;
+                continue;
+            }
+            return false;
+        }
+        if m.Protect & rw == 0 || m.Protect & 0x100 != 0 {
             return false;
         }
         at = m.BaseAddress as usize + m.RegionSize;
@@ -1030,7 +1043,13 @@ impl QueueInner {
         let mut e = self.errors.lock().unwrap();
         e.0 += 1;
         if e.1.is_none() {
-            crate::xlog_warn!("DirectStorage: a request failed ({hr:#x}): {} bytes from {}", request.destination_size, file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default());
+            crate::xlog_warn!(
+                "DirectStorage: a request failed ({hr:#x}): {} bytes from {} (dst {:#x}, options {:#x})",
+                request.destination_size,
+                file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default(),
+                request.destination,
+                request.options,
+            );
             e.1 = Some(FirstError { hr, request, file: file.map(|f| f.path.clone()).unwrap_or_default() });
         }
         unsafe { SetEvent(self.error_event as HANDLE) };
@@ -2481,6 +2500,16 @@ mod tests {
             queue_close(q);
             queue_release(q);
             status_release(s);
+        }
+    }
+
+    #[test]
+    fn writable_commits_sparse_reserved_memory() {
+        if let Some(u) = crate::gpu::uma::get() {
+            if let Some(r) = u.sparse_reserve(0x2_0000) {
+                assert!(writable(r, 0x1_0000));
+                assert!(writable(r + 0x1_0000, 0x1_0000));
+            }
         }
     }
 }

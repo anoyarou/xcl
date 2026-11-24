@@ -221,10 +221,15 @@ pub mod mirrors {
 /// The console's MEM_64K_PAGES (MEM_LARGE_PAGES | MEM_PHYSICAL): title memory of 64 KiB
 /// pages – GPU-visible on the console like all title memory.
 const MEM_64K_PAGES: u32 = 0x2040_0000;
+/// MEM_LARGE_PAGES: the console's 2 MiB pages of title memory (alone, or in MEM_64K_PAGES)
+const MEM_LARGE_PAGES_X: u32 = 0x2000_0000;
+/// a protection bit of the console's title memory the GPU uses (GTA VI's index and vertex data:
+/// 0x22004; its 2.2 GB block of other data: 0x2404)
+const PAGE_GPU_X: u32 = 0x2_0000;
 
 /// Commit `[a, a + n)` of a sparse window (the title's reservations there) and give it video
 /// memory (`d3d12x::sparse`).
-unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
+pub(crate) unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
     let q = mem::VirtualAlloc(a as *const c_void, n, mem::MEM_COMMIT, sanitize_protect(p));
     if !q.is_null() {
         crate::hle::d3d12x::sparse::committed(q as usize, n);
@@ -244,14 +249,20 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         trace_mem("VirtualAlloc (sparse commit)", addr as usize, size, t as u64, p, q as usize);
         return q;
     }
-    // the title's own reservations of 64 KiB pages: in a sparse window, so the GPU sees them
-    if addr.is_null() && t & 0x2000 != 0 && t & MEM_64K_PAGES == MEM_64K_PAGES {
-        if let Some(q) = uma.and_then(|u| u.sparse_reserve(size)) {
+    // the title's own reservations of 64 KiB or large pages: in a sparse window, so the GPU sees
+    // them (GTA VI keeps index and vertex data in a 1.2 GB VirtualAlloc of large pages; outside
+    // the windows the GPU faulted on it – a driver timeout)
+    let large = t & MEM_64K_PAGES != MEM_64K_PAGES && t & MEM_LARGE_PAGES_X != 0 && p & PAGE_GPU_X != 0;
+    if addr.is_null() && t & 0x2000 != 0 && (t & MEM_64K_PAGES == MEM_64K_PAGES || large) {
+        // (large pages: from the highest window down – the title's physical pages, gigabytes
+        // in one piece, keep the lower ones)
+        let top = |u: &crate::gpu::uma::Uma| (1..crate::gpu::uma::MAX_WINDOWS).rev().find_map(|k| u.sparse_alloc_in(k, size, crate::gpu::uma::GRAIN).map(|(q, _)| q));
+        if let Some(q) = uma.and_then(|u| if large { top(u).or_else(|| u.sparse_reserve(size)) } else { u.sparse_reserve(size) }) {
             if t & 0x1000 != 0 && commit_sparse(q, size, p).is_null() {
                 uma.map(|u| u.sparse_release(q));
                 return std::ptr::null_mut();
             }
-            trace_mem("VirtualAlloc (64K pages, sparse)", 0, size, t as u64, p, q);
+            trace_mem("VirtualAlloc (sparse reserve)", 0, size, t as u64, p, q);
             return q as *mut c_void;
         }
     }
@@ -316,6 +327,13 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             if let Some(q) = u.committed_window().filter(|_| fits).and_then(|k| u.alloc_in(k, size, align)) {
                 trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
                 return q as *mut c_void;
+            }
+            if crate::util::under_wine() {
+                let rounded = size.max(1).div_ceil(align) * align;
+                if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
+                    trace_mem("VirtualAlloc (graphics, sparse VRAM fallback)", 0, rounded, t as u64, p, q);
+                    return q as *mut c_void;
+                }
             }
         }
     }
@@ -737,10 +755,18 @@ fn process_private_bytes() -> u64 {
         c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
         if K32GetProcessMemoryInfo(thr::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb) != 0 {
             // Wine fills the fields before PrivateUsage only; PagefileUsage is the same number
-            // on Windows (the commit charge)
-            if c.PrivateUsage != 0 { c.PrivateUsage as u64 } else { c.PagefileUsage as u64 }
+            // on Windows (the commit charge). On Wine on Linux, PagefileUsage can also be 0, so
+            // fall back to WorkingSetSize or a non-zero baseline.
+            let bytes = if c.PrivateUsage != 0 {
+                c.PrivateUsage as u64
+            } else if c.PagefileUsage != 0 {
+                c.PagefileUsage as u64
+            } else {
+                c.WorkingSetSize as u64
+            };
+            if bytes != 0 { bytes } else { 64 * 1024 * 1024 }
         } else {
-            0
+            64 * 1024 * 1024
         }
     }
 }

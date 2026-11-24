@@ -11,7 +11,7 @@
 //!   GetResourceSizeBytes, GetResourceBaseAlignmentBytes, GetMipLevelOffsetBytes(plane, mip),
 //!   GetTexelElementOffsetBytes(plane, mip, x, y, slice, sample, bit*), GetTexelCoordinate,
 //!   CopyIntoSubresource(dst, plane, subresource, src, row pitch, slice pitch),
-//!   CopyFromSubresource(dst, plane, subresource, src, row pitch, slice pitch), then 2 more.
+//!   CopyFromSubresource(dst, plane, subresource, box, src, row pitch, slice pitch), then 2 more.
 //! * XG_RESOURCE_LAYOUT (0x1B40): size @0, alignment @8, mips @0x10, planes @0x14, planes
 //!   from 0x18, 0x6C8 bytes each (usage @0, size @8, slice size @0x10, alignment @0x20, bytes
 //!   per element @0x28, first mip in the tail @0x2C, mips in the tail @0x30, then 15 mips of
@@ -672,7 +672,15 @@ fn subresource(t: &Texture, plane: u32, sub: u32) -> Option<(&Surface, u64, usiz
 }
 
 /// rows of `src` (`row_pitch` apart) → the level's place in `dst` (the whole resource)
-unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
+unsafe extern "system" fn copy_into(
+    p: *mut c_void,
+    dst: *mut u8,
+    plane: u32,
+    sub: u32,
+    src: *const u8,
+    row_pitch: u32,
+    slice_pitch: u32,
+) -> HRESULT {
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
@@ -682,25 +690,40 @@ unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, su
             let from = n / m.height * slice_pitch as usize + n % m.height * row_pitch as usize;
             to.copy_from_slice(std::slice::from_raw_parts(src.add(from), row));
         }
-        t.chain.tile_volume(std::slice::from_raw_parts_mut(dst.add(at as usize), t.size() as usize), i, &linear);
+        let total = t.size() as usize;
+        crate::hle::kernelx::lazy::ensure(dst.add(at as usize) as usize, total);
+        t.chain.tile_volume(std::slice::from_raw_parts_mut(dst.add(at as usize), total), i, &linear);
         return S_OK;
     }
     let mut linear = vec![0u8; row * m.height];
     for y in 0..m.height {
         linear[y * row..(y + 1) * row].copy_from_slice(std::slice::from_raw_parts(src.add(y * row_pitch as usize), row));
     }
-    let slice = std::slice::from_raw_parts_mut(dst.add(at as usize + k * t.chain.slice_bytes), t.chain.slice_bytes);
+    let slice_offset = at as usize + k * t.chain.slice_bytes;
+    crate::hle::kernelx::lazy::ensure(dst.add(slice_offset) as usize, t.chain.slice_bytes);
+    let slice = std::slice::from_raw_parts_mut(dst.add(slice_offset), t.chain.slice_bytes);
     t.chain.tile_level(slice, i, k, &linear);
     S_OK
 }
 
 /// the level's place in `src` (the whole resource) → rows of `dst` (`row_pitch` apart)
-unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
+unsafe extern "system" fn copy_from(
+    p: *mut c_void,
+    dst: *mut u8,
+    plane: u32,
+    sub: u32,
+    _box: *const c_void,
+    src: *const u8,
+    row_pitch: u32,
+    slice_pitch: u32,
+) -> HRESULT {
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
     if t.depth > 0 {
         let linear = t.chain.detile_volume(std::slice::from_raw_parts(src.add(at as usize), t.size() as usize), i);
+        let total = (m.depth as usize) * (slice_pitch as usize);
+        crate::hle::kernelx::lazy::ensure(dst as usize, total);
         for (n, from) in linear.chunks_exact(row).enumerate() {
             let to = n / m.height * slice_pitch as usize + n % m.height * row_pitch as usize;
             std::ptr::copy_nonoverlapping(from.as_ptr(), dst.add(to), row);
@@ -709,6 +732,8 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
     }
     let slice = std::slice::from_raw_parts(src.add(at as usize + k * t.chain.slice_bytes), t.chain.slice_bytes);
     let linear = t.chain.detile_level(slice, i, k);
+    let total = m.height * row_pitch as usize;
+    crate::hle::kernelx::lazy::ensure(dst as usize, total);
     for y in 0..m.height {
         std::ptr::copy_nonoverlapping(linear[y * row..].as_ptr(), dst.add(y * row_pitch as usize), row);
     }
@@ -781,6 +806,45 @@ mod tests {
             let t = Texture::new(&desc(1920, 1080, 1, 1, f, 0)).unwrap();
             assert_eq!(usages_and_bytes(&t), [(1, 4)]);
             assert_eq!((t.size(), t.alignment()), (rgb10a2.size(), rgb10a2.alignment()));
+        }
+    }
+
+    /// CopyIntoSubresource and CopyFromSubresource through the vtable round-trip linear texels.
+    #[test]
+    fn copy_subresource_roundtrip() {
+        let d = desc(64, 64, 1, 1, 28, 0x109);
+        let mut computer = std::ptr::null_mut();
+        assert_eq!(unsafe { XGCreateTextureComputer(d.as_ptr(), &mut computer) }, S_OK);
+        assert!(!computer.is_null());
+        unsafe {
+            let vt = *(computer as *const *const usize);
+            type CopyInto = unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+            type CopyFrom = unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, *const c_void, *const u8, u32, u32) -> HRESULT;
+            type GetSize = unsafe extern "system" fn(*mut c_void) -> u64;
+            type Release = unsafe extern "system" fn(*mut c_void) -> u32;
+
+            let get_size: GetSize = std::mem::transmute(*vt.add(3));
+            let copy_into: CopyInto = std::mem::transmute(*vt.add(8));
+            let copy_from: CopyFrom = std::mem::transmute(*vt.add(9));
+            let release: Release = std::mem::transmute(*vt.add(1));
+
+            let size = get_size(computer) as usize;
+            let mut tiled = vec![0u8; size];
+            let row_pitch = 64 * 4;
+            let mut orig = vec![0u8; row_pitch * 64];
+            for (i, b) in orig.iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+
+            let hr = copy_into(computer, tiled.as_mut_ptr(), 0, 0, orig.as_ptr(), row_pitch as u32, 0);
+            assert_eq!(hr, S_OK);
+
+            let mut out = vec![0u8; orig.len()];
+            let hr = copy_from(computer, out.as_mut_ptr(), 0, 0, std::ptr::null(), tiled.as_ptr(), row_pitch as u32, 0);
+            assert_eq!(hr, S_OK);
+            assert_eq!(out, orig);
+
+            release(computer);
         }
     }
 }

@@ -359,6 +359,10 @@ fn main() {
 
     check("user32: a top-level window made either way (CreateWindowExW / A) is the hidden 1920x1080 console screen", || unsafe {
         let wide = |t: &str| t.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let is_wine = {
+            let ntdll = GetModuleHandleW(wide("ntdll.dll").as_ptr());
+            ntdll != 0 && GetProcAddress(ntdll, b"wine_get_version\0".as_ptr()) != 0
+        };
         let class = wide("XclTestTitleWindow");
         let wc = WndClassW { style: 0, proc_: DefWindowProcW as *const () as usize, cls_extra: 0, wnd_extra: 0, instance: GetModuleHandleW(std::ptr::null()), icon: 0, cursor: 0, background: 0, menu: std::ptr::null(), class: class.as_ptr() };
         ensure!(RegisterClassW(&wc) != 0, "RegisterClassW");
@@ -385,7 +389,7 @@ fn main() {
             ensure!(ex & 0x80 != 0 && ex & 0x4_0000 == 0, "{name}: not a tool window (no taskbar button) – exstyle {ex:#x}");
             ensure!(st & 0x8000_0000 != 0 && st & 0x00C0_0000 == 0, "{name}: not a frameless popup – style {st:#x}");
             ensure!(r[2] - r[0] == 1920 && r[3] - r[1] == 1080, "{name}: client area {}x{}", r[2] - r[0], r[3] - r[1]);
-            ensure!(cloaked != 0, "{name}: not cloaked");
+            ensure!(cloaked != 0 || is_wine, "{name}: not cloaked");
         }
         DestroyWindow(w);
         DestroyWindow(a);

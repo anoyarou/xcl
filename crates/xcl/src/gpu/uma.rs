@@ -179,7 +179,11 @@ impl Uma {
                 continue;
             }
             let c_base = base + (MAX_WINDOWS - 1) * WINDOW;
-            let cp = unsafe { VirtualAlloc(c_base as *const std::ffi::c_void, committed, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+            // Under Wine without userfaultfd, MEM_WRITE_WATCH uses mprotect(PROT_READ), which
+            // triggers amdgpu userptr MMU-notifier evictions and ~100ms GPU stalls on the
+            // coherent window imported via OpenExistingHeapFromAddress.
+            let c_flags = if crate::util::under_wine() { MEM_RESERVE | MEM_COMMIT } else { MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH };
+            let cp = unsafe { VirtualAlloc(c_base as *const std::ffi::c_void, committed, c_flags, PAGE_READWRITE) };
             if cp as usize != c_base {
                 if !cp.is_null() {
                     unsafe { VirtualFree(cp, 0, MEM_RELEASE) };
@@ -382,7 +386,8 @@ impl Uma {
             for k in 0..windows {
                 let want = base + k * WINDOW;
                 // write-watched: textures the title keeps here are uploaded again after CPU writes
-                let p = unsafe { VirtualAlloc(want as *const std::ffi::c_void, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+                let c_flags = if crate::util::under_wine() { MEM_RESERVE | MEM_COMMIT } else { MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH };
+                let p = unsafe { VirtualAlloc(want as *const std::ffi::c_void, size, c_flags, PAGE_READWRITE) };
                 if p.is_null() {
                     break;
                 }
@@ -453,7 +458,9 @@ impl Uma {
             match self.kinds[k] {
                 WindowKind::None => k += 1,
                 WindowKind::Committed(s) => {
-                    out.push((self.base + k * WINDOW, s));
+                    if !crate::util::under_wine() {
+                        out.push((self.base + k * WINDOW, s));
+                    }
                     k += 1;
                 }
                 WindowKind::Sparse => {
@@ -678,6 +685,12 @@ fn coherent_file() -> std::path::PathBuf {
 pub fn coherent_hint() -> usize {
     if let Some(mb) = std::env::var("XCL_COHERENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
         return (mb << 20).clamp(GRAIN, MAX_SIZE);
+    }
+    // Under Wine/vkd3d-proton on Linux (amdgpu), a multi-GiB userptr BO imported via
+    // OpenExistingHeapFromAddress stalls every GPU submission (~150 ms/frame); keep the
+    // coherent window at 512 MiB and place overflow title GPU heaps in the sparse VRAM windows.
+    if crate::util::under_wine() {
+        return RUNTIME_COMMITTED_CAP;
     }
     let title = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
     // only with the commit for all of it: the title's ~13 GB, video memory for its render targets
@@ -938,7 +951,13 @@ mod tests {
         assert_eq!(u.sparse_release(y), Some(GRAIN));
         assert_eq!(u.sparse_release(desc), Some(GRAIN));
         assert_eq!(u.sparse_used(), 0);
-        // Contiguous sparse windows 0..2 are reported as one OS watch region; window 3 as another.
-        assert_eq!(u.watch_regions(), vec![(u.base(), 3 * WINDOW), (u.base() + 3 * WINDOW, 16 << 20)]);
+        // Contiguous sparse windows 0..2 are reported as one OS watch region; window 3 as another
+        // on native Windows (excluded under Wine to avoid amdgpu userptr MMU-notifier stalls).
+        let expected = if crate::util::under_wine() {
+            vec![(u.base(), 3 * WINDOW)]
+        } else {
+            vec![(u.base(), 3 * WINDOW), (u.base() + 3 * WINDOW, 16 << 20)]
+        };
+        assert_eq!(u.watch_regions(), expected);
     }
 }

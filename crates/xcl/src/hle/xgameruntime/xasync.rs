@@ -220,6 +220,7 @@ unsafe extern "system" fn do_work_cb(ctx: *mut c_void, canceled: bool) {
 unsafe extern "system" fn completion_cb(ctx: *mut c_void, _canceled: bool) {
     let b = ctx as *mut XAsyncBlock;
     if (*b).callback != 0 {
+        crate::xlog_info!("XAsync: running completion callback {:#x} for block {:?}", (*b).callback, b);
         let f: Completion = std::mem::transmute((*b).callback);
         f(b);
     }

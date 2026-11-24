@@ -726,43 +726,72 @@ fn cached_file(file: &Path) -> Option<Vec<u8>> {
 
 /// Cheap validation before handing a cached blob to D3D12. DXIL uses the DXBC
 /// container header: magic, hash, version, total size, chunk count and offsets.
-fn valid_dxil_container(blob: &[u8]) -> bool {
+fn validate_dxil_container(blob: &[u8]) -> Result<(), String> {
     let rd = |at: usize| {
         blob.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
     };
-    if blob.len() < 36 || blob.get(..4) != Some(b"DXBC") || rd(20) != Some(1) || rd(24) != Some(blob.len()) {
-        return false;
+    if blob.len() < 36 {
+        return Err(format!("len {} < 36", blob.len()));
     }
-    let Some(count) = rd(28) else { return false };
+    if blob.get(..4) != Some(b"DXBC") {
+        return Err(format!("magic {:?} != DXBC", blob.get(..4)));
+    }
+    if rd(20) != Some(1) {
+        return Err(format!("version {:?} != 1", rd(20)));
+    }
+    if rd(24) != Some(blob.len()) {
+        return Err(format!("size header {:?} != blob len {}", rd(24), blob.len()));
+    }
+    let Some(count) = rd(28) else {
+        return Err("cannot read count".into());
+    };
     if count == 0 || count > 64 {
-        return false;
+        return Err(format!("count {count} not in 1..=64"));
     }
-    let Some(table_end) = 32usize.checked_add(count * 4) else { return false };
+    let Some(table_end) = 32usize.checked_add(count * 4) else {
+        return Err("table_end overflow".into());
+    };
     if table_end > blob.len() {
-        return false;
+        return Err(format!("table_end {table_end} > blob len {}", blob.len()));
     }
     let mut ranges = Vec::with_capacity(count);
     let mut has_dxil = false;
     for i in 0..count {
-        let Some(off) = rd(32 + i * 4) else { return false };
-        if off < table_end || off & 3 != 0 {
-            return false;
+        let Some(off) = rd(32 + i * 4) else {
+            return Err(format!("chunk {i} cannot read offset"));
+        };
+        if off < table_end {
+            return Err(format!("chunk {i} offset {off} < table_end {table_end}"));
         }
-        let Some(size) = rd(off + 4) else { return false };
-        let Some(end) = off.checked_add(8).and_then(|v| v.checked_add(size)) else { return false };
-        if end > blob.len() || ranges.iter().any(|&(a, b)| off < b && a < end) {
-            return false;
+        let Some(size) = rd(off + 4) else {
+            return Err(format!("chunk {i} cannot read size"));
+        };
+        let Some(end) = off.checked_add(8).and_then(|v| v.checked_add(size)) else {
+            return Err(format!("chunk {i} offset+size overflow"));
+        };
+        if end > blob.len() {
+            return Err(format!("chunk {i} end {end} > blob len {}", blob.len()));
+        }
+        if ranges.iter().any(|&(a, b)| off < b && a < end) {
+            return Err(format!("chunk {i} [{off}..{end}) overlaps existing chunk"));
         }
         if blob.get(off..off + 4) == Some(b"DXIL") {
             // DxilProgramHeader is six dwords before the bitcode payload.
             if size < 24 || blob.get(off + 16..off + 20) != Some(b"DXIL") {
-                return false;
+                return Err(format!("chunk {i} DXIL size {size} or magic {:?} invalid", blob.get(off + 16..off + 20)));
             }
             has_dxil = true;
         }
         ranges.push((off, end));
     }
-    has_dxil
+    if !has_dxil {
+        return Err("no DXIL chunk found".into());
+    }
+    Ok(())
+}
+
+fn valid_dxil_container(blob: &[u8]) -> bool {
+    validate_dxil_container(blob).is_ok()
 }
 
 fn compile_cached_in_with<F>(dir: &Path, src: &str, entry: &str, profile: &str, compile_one: F) -> Result<(Vec<u8>, bool), String>
@@ -816,11 +845,19 @@ where
         let _active = Compiling::start();
         compile_one()
     }
-    .and_then(|b| {
-        if valid_dxil_container(&b) {
-            Ok(b)
+    .and_then(|mut b| {
+        let rd = |at: usize| {
+            b.get(at..at + 4).map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
+        };
+        if let Some(hdr_size) = rd(24) {
+            if b.len() > hdr_size && hdr_size >= 32 && b.get(..4) == Some(b"DXBC") {
+                b.truncate(hdr_size);
+            }
+        }
+        if let Err(e) = validate_dxil_container(&b) {
+            Err(format!("DXIL cache: compiler returned an invalid DXIL container ({e})"))
         } else {
-            Err("DXIL cache: compiler returned an invalid DXIL container".into())
+            Ok(b)
         }
     })
     .map_err(|e| {

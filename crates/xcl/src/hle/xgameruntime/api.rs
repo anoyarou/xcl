@@ -163,6 +163,9 @@ unsafe fn pc_object(c: &Guid, i: &Guid) -> Option<usize> {
 
 /// After the PC runtime is initialised: XCL's async APIs on its XAsync.
 unsafe fn start_pc_async() {
+    if crate::util::under_wine() || std::env::var_os("XCL_XASYNC").is_some() {
+        return;
+    }
     if let Some(o) = pc_object(&XASYNC, &XASYNC) {
         super::xasync::use_pc(o);
     }
@@ -288,6 +291,11 @@ pub unsafe extern "system" fn QueryApiImpl(clsid: *const Guid, iid: *const Guid,
             o
         };
         *out = target as *const Obj as *mut c_void;
+        return S_OK;
+    }
+    if c == XASYNC && (crate::util::under_wine() || std::env::var_os("XCL_XASYNC").is_some()) {
+        note(c, i, "XAsync: XCL (in-process on Wine)".into());
+        *out = xcl_xasync_object() as *const Obj as *mut c_void;
         return S_OK;
     }
     match pc_object(&c, &i) {

@@ -527,6 +527,7 @@ pub unsafe extern "system" fn XUserAddResult(b: *mut XAsyncBlock, out: *mut *mut
         return E_INVALIDARG;
     }
     let hr = XAsyncGetResult(b, &USER_ADD_IDENTITY as *const u8 as *const c_void, 8, out as *mut c_void, std::ptr::null_mut());
+    crate::xlog_info!("XUserAddResult → hr={hr:#x}, user={:?}", if hr >= 0 { *out } else { std::ptr::null_mut() });
     if hr >= 0 {
         user_signed_in();
     }
