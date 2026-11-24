@@ -944,7 +944,7 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
                 }
                 r
             }
-            Item::Block { raise: Some(CONT | DIRECT_RET), .. } => BTreeSet::new(),
+            Item::Block { raise: Some(CONT) | Some(DIRECT_RET), .. } => BTreeSet::new(),
             Item::Block { raise, .. } => raise.into_iter().collect(),
         };
         if let Some(t) = raised.iter().find(|&&t| t < e && !cont.heads(t)) {
