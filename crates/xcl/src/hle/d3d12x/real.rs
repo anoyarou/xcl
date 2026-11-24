@@ -5138,6 +5138,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
         FrontFace: keep,
         BackFace: keep,
     };
+    let mut has_depth_stencil = false;
     for (ty, p) in &subs {
         match ty {
             0 => put(&mut g.pRootSignature, p),
@@ -5151,7 +5152,10 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             9 => put(&mut g.SampleMask, p),
             10 => put(&mut g.RasterizerState, p),
             // DEPTH_STENCIL; DEPTH_STENCIL1 is that and the depth bounds test
-            11 | 21 => put(&mut g.DepthStencilState, p),
+            11 | 21 => {
+                has_depth_stencil = true;
+                put(&mut g.DepthStencilState, p);
+            }
             12 => put(&mut g.InputLayout, p),
             13 => put(&mut g.IBStripCutValue, p),
             14 => put(&mut g.PrimitiveTopologyType, p),
@@ -5166,6 +5170,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             18 => put(&mut g.NodeMask, p),
             20 => put(&mut g.Flags, p),
             26 => {
+                has_depth_stencil = true;
                 let mut d: D3D12_DEPTH_STENCIL_DESC2 = std::mem::zeroed();
                 put(&mut d, p);
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC1| D3D12_DEPTH_STENCILOP_DESC { StencilFailOp: f.StencilFailOp, StencilDepthFailOp: f.StencilDepthFailOp, StencilPassOp: f.StencilPassOp, StencilFunc: f.StencilFunc };
@@ -5197,6 +5202,11 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             }
             _ => {}
         }
+    }
+    // D3D12 pipeline state streams default DepthEnable to FALSE when no depth-stencil
+    // subobject is supplied and DSVFormat is DXGI_FORMAT_UNKNOWN (0).
+    if !has_depth_stencil && g.DSVFormat.0 == 0 {
+        g.DepthStencilState.DepthEnable = false.into();
     }
     // a rect list stays one for translated_graphics_pso, which gives it its GS (untranslated, it
     // becomes the PC's in graphics_pso)
@@ -6554,5 +6564,62 @@ mod map_tests {
                 m.remove(&(upload.as_raw() as usize));
             }
         }
+    }
+
+    #[test]
+    fn stream_pipeline_defaults_depth_enable_from_dsv_format() {
+        let console_vs = crate::gpu::xbox::tests::sample(
+            1,
+            &[crate::gpu::xbox::tests::fssm(&crate::gpu::xbox::tests::CODE, &[])],
+        );
+        let push_sub = |buf: &mut Vec<u8>, ty: u32, payload: &[u8], align: usize| {
+            buf.extend_from_slice(&ty.to_le_bytes());
+            if align == 8 {
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            }
+            buf.extend_from_slice(payload);
+            while buf.len() % 8 != 0 {
+                buf.push(0);
+            }
+        };
+        let parse = |dsv_format: Option<u32>, explicit_depth: Option<bool>| -> D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            let mut stream = Vec::new();
+            let mut vs_bc = [0u8; 16];
+            vs_bc[0..8].copy_from_slice(&(console_vs.as_ptr() as usize).to_le_bytes());
+            vs_bc[8..16].copy_from_slice(&console_vs.len().to_le_bytes());
+            push_sub(&mut stream, 1, &vs_bc, 8);
+            if let Some(fmt) = dsv_format {
+                push_sub(&mut stream, 16, &fmt.to_le_bytes(), 4);
+            }
+            if let Some(en) = explicit_depth {
+                let ds = D3D12_DEPTH_STENCIL_DESC {
+                    DepthEnable: en.into(),
+                    ..Default::default()
+                };
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(&ds as *const _ as *const u8, std::mem::size_of::<D3D12_DEPTH_STENCIL_DESC>())
+                };
+                push_sub(&mut stream, 11, bytes, 4);
+            }
+            #[repr(C)]
+            struct StreamDesc {
+                size: usize,
+                ptr: usize,
+            }
+            let desc = StreamDesc { size: stream.len(), ptr: stream.as_ptr() as usize };
+            match unsafe { stream_pipeline(&desc as *const _ as *const c_void) } {
+                StreamPipeline::Graphics(g) => *g,
+                _ => panic!("expected graphics stream pipeline"),
+            }
+        };
+
+        // Omitted DEPTH_STENCIL + omitted/UNKNOWN DSVFormat -> DepthEnable defaults to false.
+        assert!(!parse(None, None).DepthStencilState.DepthEnable.as_bool());
+        assert!(!parse(Some(0), None).DepthStencilState.DepthEnable.as_bool());
+        // Omitted DEPTH_STENCIL + non-UNKNOWN DSVFormat (D32_FLOAT = 40) -> DepthEnable defaults to true.
+        assert!(parse(Some(40), None).DepthStencilState.DepthEnable.as_bool());
+        // Explicit DEPTH_STENCIL subobject is always preserved regardless of DSVFormat.
+        assert!(parse(None, Some(true)).DepthStencilState.DepthEnable.as_bool());
+        assert!(!parse(Some(40), Some(false)).DepthStencilState.DepthEnable.as_bool());
     }
 }
