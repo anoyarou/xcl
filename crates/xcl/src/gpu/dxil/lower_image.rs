@@ -854,10 +854,14 @@ impl Lw {
             let tmps = tmps.clone();
             self.guarded(is, &mut |lw| {
                 let tex: Texture = lw.s.heap_texture(tw0, kind, false, ct, 4, true);
+                // Emit all TextureLoad calls before GetDimensions in this basic block:
+                // AMD's DXIL compiler (amdxc64.dll) hits a null-pointer dereference
+                // (0xc0000005) when dx.op.getDimensions precedes dx.op.textureLoad on a
+                // dynamically indexed heap Texture2DMS/Texture2DMSArray in the same block.
+                let loads: Vec<[Value; 4]> = samples.iter().map(|&sv| lw.s.texture_load_sample(tex, sv, &coords)).collect();
                 let dims = lw.s.get_dimensions(tex.handle, None);
                 let count = lw.s.m.extract(dims, 3);
-                for (si, &sv) in samples.iter().enumerate() {
-                    let r = lw.s.texture_load_sample(tex, sv, &coords);
+                for (si, (&sv, r)) in samples.iter().zip(loads).enumerate() {
                     let inside = lw.cmp(Pred::ULt, sv, count);
                     for k in 0..4 {
                         let b = lw.bits(r[k]);
