@@ -3904,6 +3904,9 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         driver_cache::note(true, None);
     }
     if hr < 0 {
+        if hr == windows::Win32::Foundation::E_OUTOFMEMORY.0 && in_driver >= super::pso_async::DRIVER_GAVE_UP_AFTER {
+            super::pso_async::note_driver_gave_up(true);
+        }
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
         return Some(Err(()));
     }
