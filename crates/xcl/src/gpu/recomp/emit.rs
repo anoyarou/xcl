@@ -7284,6 +7284,8 @@ mod opt_helper_tests {
                 "{label}: non-heap_windows Window-0 fast path should bypass xcl_mLoad:\n{root_main}"
             );
         }
+    }
+}
 
 mod tests {
     use super::PRELUDE_MEM;
