@@ -1366,7 +1366,7 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: super::MEM_HEAP_BASE + 4,
+                NumDescriptors: super::MEM_HEAP_NULL + 1,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
@@ -1378,6 +1378,7 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
             dev.CreateUnorderedAccessView(b, None::<&ID3D12Resource>, Some(&raw_window_uav(size as u64)), h);
         }
+        set_null_window_view(dev, dh.GetCPUDescriptorHandleForHeapStart(), inc);
         list.SetDescriptorHeaps(&[Some(dh.clone())]);
         list.SetComputeRootSignature(&gpu.rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
@@ -1424,6 +1425,17 @@ pub fn raw_window_uav(bytes: u64) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Buffer: D3D12_BUFFER_UAV { FirstElement: 0, NumElements: (bytes / 4) as u32, StructureByteStride: 0, CounterOffsetInBytes: 0, Flags: D3D12_BUFFER_UAV_FLAG_RAW },
         },
     }
+}
+
+/// The null raw UAV at `MEM_HEAP_NULL` of a heap starting at `start` (`Options::heap_windows`:
+/// accesses outside a program's windows select it – loads and atomics give 0, stores drop).
+///
+/// # Safety
+/// `start` is the CPU handle of a heap of `dev` with at least `MEM_HEAP_NULL + 1` descriptors
+/// of increment `inc`.
+pub unsafe fn set_null_window_view(dev: &ID3D12Device, start: D3D12_CPU_DESCRIPTOR_HANDLE, inc: usize) {
+    let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + super::MEM_HEAP_NULL as usize * inc };
+    dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&raw_window_uav(4)), at);
 }
 
 /// Create a committed resource from a description (validation of decoded descriptors).
@@ -1529,7 +1541,7 @@ fn dispatch_with(
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: super::MEM_HEAP_BASE + 4,
+                NumDescriptors: super::MEM_HEAP_NULL + 1,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
@@ -1540,6 +1552,7 @@ fn dispatch_with(
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
             dev.CreateUnorderedAccessView(&mem_buf, None::<&ID3D12Resource>, Some(&raw_window_uav(mem_bytes)), h);
         }
+        set_null_window_view(dev, dh.GetCPUDescriptorHandleForHeapStart(), inc);
         list.SetDescriptorHeaps(&[Some(dh.clone()), Some(bound._heaps[1].clone())]);
         list.SetComputeRootSignature(rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());

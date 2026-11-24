@@ -158,8 +158,9 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
             heap,
             cap,
-            // the memory windows' raw UAVs (`set_window_views`) come first
-            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_WINDOWS as u32,
+            // the memory windows' raw UAVs and the null view after them (`set_window_views`)
+            // come first
+            next: crate::gpu::recomp::MEM_HEAP_NULL + 1,
             free: Vec::new(),
         });
     }
@@ -175,9 +176,9 @@ pub fn window_views_failed() -> bool {
 }
 
 /// The memory windows' buffers `(resource, bytes)` as raw UAVs at `MEM_HEAP_BASE + k` of the
-/// shared heap, made now if need be (`Options::heap_windows`: shaders take window k from there).
-/// A window without a buffer gets window 0's. False (and the shaders keep the switch): no
-/// shared heap.
+/// shared heap, and the null view at `MEM_HEAP_NULL` after them, made now if need be
+/// (`Options::heap_windows`: shaders take window k from there). A window without a buffer
+/// gets window 0's. False (and the shaders keep the switch): no shared heap.
 pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -> bool {
     let ok = !windows.is_empty() && windows[0].0 != 0 && shared_heap(dev) && {
         let (device, cpu, inc) = {
@@ -193,6 +194,8 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
             let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + (crate::gpu::recomp::MEM_HEAP_BASE as u64 + k as u64) * inc as u64) as usize };
             device.CreateUnorderedAccessView(r, None::<&ID3D12Resource>, Some(&crate::gpu::recomp::runner::raw_window_uav(bytes as u64)), at);
         }
+        // accesses outside a program's windows select the null view at MEM_HEAP_NULL
+        crate::gpu::recomp::runner::set_null_window_view(&device, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu as usize }, inc as usize);
         true
     };
     if !ok {
@@ -558,13 +561,17 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         static UNLOCKED: AtomicBool = AtomicBool::new(true);
         static CALLS: AtomicU32 = AtomicU32::new(0);
+        static NULL_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         #[repr(C)]
         struct Object { vt: *const usize }
         unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
-        unsafe extern "system" fn create_uav(_this: *mut c_void, _resource: *mut c_void, _counter: *mut c_void, _desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, _at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        unsafe extern "system" fn create_uav(_this: *mut c_void, resource: *mut c_void, _counter: *mut c_void, _desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             // The adopted device hook can re-enter descriptor bookkeeping.
             UNLOCKED.fetch_and(GLOBAL.try_lock().is_ok(), Ordering::Relaxed);
             CALLS.fetch_add(1, Ordering::Relaxed);
+            if resource.is_null() {
+                NULL_AT.store(at.ptr, Ordering::Relaxed);
+            }
         }
         let mut vt = [0usize; 20];
         vt[1] = retain as usize;
@@ -579,10 +586,12 @@ mod tests {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
-                next: crate::gpu::uma::MAX_WINDOWS as u32, free: Vec::new(),
+                next: crate::gpu::recomp::MEM_HEAP_NULL + 1, free: Vec::new(),
             });
             assert!(set_window_views(&dev, &[(&mut resource as *mut _ as usize, 0x10000)]));
-            assert_eq!(CALLS.load(Ordering::Relaxed), crate::gpu::uma::MAX_WINDOWS as u32);
+            // one view per window, then the null view after them
+            assert_eq!(CALLS.load(Ordering::Relaxed), crate::gpu::uma::MAX_WINDOWS as u32 + 1);
+            assert_eq!(NULL_AT.load(Ordering::Relaxed), 0x1000 + crate::gpu::recomp::MEM_HEAP_NULL as usize * 32);
             assert!(UNLOCKED.load(Ordering::Relaxed), "device callback ran while GLOBAL was locked");
             *GLOBAL.lock().unwrap() = None;
         }

@@ -185,6 +185,28 @@ enum PageKey {
     Extra(usize, usize),
 }
 
+fn pop_idle_page(
+    idle: &mut std::collections::VecDeque<(PageKey, std::time::Instant)>,
+    pages: &mut std::collections::HashMap<usize, Page>,
+    extra_pages: &mut std::collections::HashMap<(usize, usize), Page>,
+    max_age: Option<std::time::Duration>,
+    now: std::time::Instant,
+) -> Option<Page> {
+    while idle.front().is_some_and(|&(_, since)| max_age.is_none_or(|d| now.duration_since(since) >= d)) {
+        let (key, since) = idle.pop_front()?;
+        let still_idle = |p: &Page| p.idle_since == Some(since);
+        let page = match key {
+            PageKey::Own(a) if pages.get(&a).is_some_and(still_idle) => pages.remove(&a),
+            PageKey::Extra(va, i) if extra_pages.get(&(va, i)).is_some_and(still_idle) => extra_pages.remove(&(va, i)),
+            _ => None,
+        };
+        if page.is_some() {
+            return page;
+        }
+    }
+    None
+}
+
 /// The pages of `idle` – those whose last user went, oldest first, each with when – that no
 /// resource has used for `IDLE` go back to the pools: out of their map, their tile to `cooling`.
 /// An entry whose page was used again since (in use now, or idle again from a later moment, with
@@ -197,18 +219,27 @@ fn sweep_idle(
     cooling: &mut std::collections::VecDeque<(Tile, std::time::Instant)>,
     now: std::time::Instant,
 ) {
-    while idle.front().is_some_and(|&(_, since)| now.duration_since(since) >= IDLE) {
-        let Some((key, since)) = idle.pop_front() else { break };
-        let still_idle = |p: &Page| p.idle_since == Some(since);
-        let page = match key {
-            PageKey::Own(a) if pages.get(&a).is_some_and(still_idle) => pages.remove(&a),
-            PageKey::Extra(va, i) if extra_pages.get(&(va, i)).is_some_and(still_idle) => extra_pages.remove(&(va, i)),
-            _ => None,
-        };
-        if let Some(p) = page {
-            cooling.push_back((p.tile, now));
-        }
+    while let Some(p) = pop_idle_page(idle, pages, extra_pages, Some(IDLE), now) {
+        cooling.push_back((p.tile, now));
     }
+}
+
+/// Reclaim a tile when creating a new pool heap fails: first drain `cooling` into `free`,
+/// or else evict the oldest still-idle page from `idle`.
+fn reclaim_tile(
+    free: &mut Vec<Tile>,
+    cooling: &mut std::collections::VecDeque<(Tile, std::time::Instant)>,
+    idle: &mut std::collections::VecDeque<(PageKey, std::time::Instant)>,
+    pages: &mut std::collections::HashMap<usize, Page>,
+    extra_pages: &mut std::collections::HashMap<(usize, usize), Page>,
+) -> Option<Tile> {
+    if !cooling.is_empty() {
+        while let Some((t, _)) = cooling.pop_back() {
+            free.push(t);
+        }
+        return free.pop();
+    }
+    pop_idle_page(idle, pages, extra_pages, None, std::time::Instant::now()).map(|p| p.tile)
 }
 
 struct Target {
@@ -282,6 +313,18 @@ impl Pages {
     }
 
     unsafe fn take_tile(&mut self, dev: &ID3D12Device) -> Option<Tile> {
+        self.take_tile_with(dev, |desc| {
+            let mut heap: Option<ID3D12Heap> = None;
+            super::title_textures::own_work(|| dev.CreateHeap(desc, &mut heap))?;
+            Ok(heap)
+        })
+    }
+
+    unsafe fn take_tile_with(
+        &mut self,
+        dev: &ID3D12Device,
+        create_heap: impl FnOnce(&D3D12_HEAP_DESC) -> windows::core::Result<Option<ID3D12Heap>>,
+    ) -> Option<Tile> {
         if let Some(t) = self.free.pop() {
             return Some(t);
         }
@@ -295,11 +338,25 @@ impl Pages {
             // every kind of texture (resource heap tier 2: the only flags for both)
             Flags: D3D12_HEAP_FLAG_NONE,
         };
-        let mut heap: Option<ID3D12Heap> = None;
-        if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
-            crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
-            return None;
-        }
+        let heap = match create_heap(&desc) {
+            Ok(heap) => heap,
+            Err(e) => {
+                if !self.cooling.is_empty() || !self.idle.is_empty() {
+                    match crate::gpu::fence::wait(&self.fence, self.value, dev, None, 1_000) {
+                        Ok(()) => {
+                            if let Some(t) = reclaim_tile(&mut self.free, &mut self.cooling, &mut self.idle, &mut self.pages, &mut self.extra_pages) {
+                                return Some(t);
+                            }
+                        }
+                        Err(wait_err) => {
+                            crate::xlog_warn!("D3D12.X: could not wait for tile fence before OOM reclaim: {wait_err:?}");
+                        }
+                    }
+                }
+                crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
+                return None;
+            }
+        };
         self.pools.push(heap?);
         let h = self.pools.len() as u32 - 1;
         self.free.extend((1..POOL_PAGES).rev().map(|t| (h, t)));
@@ -1030,6 +1087,97 @@ mod tests {
             let small_size = dev.GetResourceAllocationInfo(0, &[small]).SizeInBytes as usize;
             assert_eq!(arena_bytes().0 - arenas0, small_size.next_multiple_of(PAGE));
             drop(last);
+        }
+    }
+
+    #[test]
+    fn reclaim_tile_drains_cooling_and_idle_pages_on_oom() {
+        use std::collections::HashMap;
+        let now = Instant::now();
+        let mut free: Vec<Tile> = Vec::new();
+        let mut cooling: std::collections::VecDeque<(Tile, Instant)> = [(0, 1), (0, 2)].into_iter().map(|t| (t, now)).collect();
+        let mut pages: HashMap<usize, Page> = HashMap::from([
+            // Stale idle entry: page was reused later and is still active (`idle_since: None`).
+            (PAGE, Page { tile: (1, 0), users: 1, idle_since: None }),
+            // Still-idle page whose `IDLE` timer has not elapsed yet.
+            (2 * PAGE, Page { tile: (1, 1), users: 0, idle_since: Some(now) }),
+        ]);
+        let mut extra: HashMap<(usize, usize), Page> = HashMap::from([
+            ((3 * PAGE, 0), Page { tile: (1, 2), users: 0, idle_since: Some(now + Duration::from_millis(10)) }),
+        ]);
+        let mut idle: std::collections::VecDeque<(PageKey, Instant)> = [
+            (PageKey::Own(PAGE), now - Duration::from_millis(50)),
+            (PageKey::Own(2 * PAGE), now),
+            (PageKey::Extra(3 * PAGE, 0), now + Duration::from_millis(10)),
+        ]
+        .into_iter()
+        .collect();
+
+        // 1. Cooling tiles are drained first into `free` (oldest first), even before `COOL` elapses.
+        assert_eq!(reclaim_tile(&mut free, &mut cooling, &mut idle, &mut pages, &mut extra), Some((0, 1)));
+        assert!(cooling.is_empty());
+        assert_eq!(free, vec![(0, 2)]);
+        free.clear();
+
+        // 2. Once `cooling` and `free` are empty, stale `idle` entries are skipped and the
+        //    oldest still-idle `Own` page is evicted, followed by the `Extra` page.
+        assert_eq!(reclaim_tile(&mut free, &mut cooling, &mut idle, &mut pages, &mut extra), Some((1, 1)));
+        assert!(!pages.contains_key(&(2 * PAGE)));
+        assert!(pages.contains_key(&PAGE), "reused active page must not be evicted");
+
+        assert_eq!(reclaim_tile(&mut free, &mut cooling, &mut idle, &mut pages, &mut extra), Some((1, 2)));
+        assert!(extra.is_empty());
+
+        // 3. When nothing reclaimable remains, `None` is returned.
+        assert_eq!(reclaim_tile(&mut free, &mut cooling, &mut idle, &mut pages, &mut extra), None);
+    }
+
+    #[test]
+    fn take_tile_reclaims_only_after_fence_on_oom() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        use windows::Win32::Foundation::E_OUTOFMEMORY;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                crate::gpu::recomp::runner::skip_test("no DXGI factory");
+                return;
+            };
+            let Ok(adapter) = factory.EnumAdapters1(0) else {
+                crate::gpu::recomp::runner::skip_test("no DXGI adapter");
+                return;
+            };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                crate::gpu::recomp::runner::skip_test("software adapter");
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else {
+                crate::gpu::recomp::runner::skip_test("no tier-2 D3D12 device");
+                return;
+            };
+            let Some(mut pages) = Pages::new(&dev) else {
+                crate::gpu::recomp::runner::skip_test("Pages::new returned None");
+                return;
+            };
+            let now = Instant::now();
+            pages.cooling.push_back(((0, 1), now));
+            pages.cooling.push_back(((0, 2), now));
+
+            let oom = |_: &D3D12_HEAP_DESC| Err(windows::core::Error::from(E_OUTOFMEMORY));
+            // Fence is already at 0 (`pages.value == 0`): OOM reclaims oldest cooling tile first.
+            assert_eq!(pages.take_tile_with(&dev, oom), Some((0, 1)));
+            assert!(pages.cooling.is_empty());
+            assert_eq!(pages.free, vec![(0, 2)]);
+
+            // Unsignaled fence (`pages.value == 1`): wait times out and cooling tile is not reclaimed.
+            pages.free.clear();
+            pages.cooling.push_back(((0, 3), now));
+            pages.value = 1;
+            assert_eq!(pages.take_tile_with(&dev, oom), None);
+            assert_eq!(pages.cooling.len(), 1);
+            assert_eq!(pages.cooling.front().map(|(t, _)| *t), Some((0, 3)));
         }
     }
 }

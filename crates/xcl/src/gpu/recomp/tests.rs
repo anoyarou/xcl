@@ -3273,7 +3273,11 @@ fn memory_windows_above_4_gib(heap: bool) {
     let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
     assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
-    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + xcl_w)]"), heap);
+    // heap windows: a window outside the program's two selects the null view after all
+    // MAX_WINDOWS descriptors (not descriptor 2, a live window's view), with no branch
+    let select = format!("ResourceDescriptorHeap[NonUniformResourceIndex(xcl_w < 2u ? 0u + xcl_w : {}u)]", super::MEM_HEAP_NULL);
+    assert_eq!(t.hlsl.contains(&select), heap);
+    assert!(!t.hlsl.contains("if (xcl_w >="), "heap windows: no branch around an access");
     let hlsl_dxil = || super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
     // the direct translator binds windows as root UAVs only (no heap windows yet)
     let dxil = if heap { hlsl_dxil() } else { direct_or(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() }), hlsl_dxil()) };

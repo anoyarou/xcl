@@ -69,6 +69,12 @@ mod heap_window_tests;
 /// window k is raw UAV `MEM_HEAP_BASE + k`.
 pub const MEM_HEAP_BASE: u32 = 0;
 
+/// The descriptor after the memory windows (`Options::heap_windows`): a null raw UAV. An access
+/// with `xcl_w` outside a program's windows takes it instead of branching around the access
+/// (a null view's loads and atomics return 0 and its stores are dropped – what the switch
+/// form's `default` does).
+pub const MEM_HEAP_NULL: u32 = MEM_HEAP_BASE + crate::gpu::uma::MAX_WINDOWS as u32;
+
 /// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
 /// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
 pub const HEAP_WINDOWS: u32 = 0x100;
