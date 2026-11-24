@@ -79,7 +79,9 @@ fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
         return hlsl;
     }
     let split = opt.wave64 && (opt.split_wave64 || runner::split_wave64());
-    let o = KernelOptions { wave64: opt.wave64, split, mem_windows: opt.mem_windows, sampler_base: opt.static_sampler_base };
+    // heap windows: `HEAP_WINDOWS` in the count, as `pso::mem_windows` passes it
+    let mem_windows = if opt.heap_windows && opt.mem_windows > 1 { opt.mem_windows | super::HEAP_WINDOWS } else { opt.mem_windows };
+    let o = KernelOptions { wave64: opt.wave64, split, mem_windows, sampler_base: opt.static_sampler_base };
     match &opt.mode {
         Mode::Kernel => translate(code, o).unwrap_or_else(|e| panic!("direct DXIL: {e}")),
         Mode::Compute(cs) => translate_compute(code, o, cs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
@@ -470,6 +472,7 @@ fn atomic_fmin_fmax_x2_are_native_64_bit_atomics() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
         super::dxc::compile(&w.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", w.hlsl));
         direct_check(&code, &Options { mem_windows: 2, ..Default::default() });
+        direct_check(&code, &Options { mem_windows: 2, heap_windows: true, ..Default::default() });
     }
 }
 
@@ -3279,8 +3282,7 @@ fn memory_windows_above_4_gib(heap: bool) {
     assert_eq!(t.hlsl.contains(&select), heap);
     assert!(!t.hlsl.contains("if (xcl_w >="), "heap windows: no branch around an access");
     let hlsl_dxil = || super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
-    // the direct translator binds windows as root UAVs only (no heap windows yet)
-    let dxil = if heap { hlsl_dxil() } else { direct_or(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() }), hlsl_dxil()) };
+    let dxil = direct_or(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() }), hlsl_dxil());
     let hi = |a: u64| (a >> 32) as u32;
     let mut st = KernelState::default();
     st.sgpr[2..4].copy_from_slice(&[(w1 + 0x1000) as u32, hi(w1)]);
@@ -3374,8 +3376,10 @@ fn gpu_memory_windows_reject_out_of_uma_aliasing() {
     ];
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let p = prog(&refs);
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
+    assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap);
+    let hlsl_dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let dxil = direct_or(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() }), hlsl_dxil);
 
     let mut st = KernelState::default();
     st.sgpr[2..4].copy_from_slice(&[0x1000, base_hi + 4]); // s[2:3]: out-of-UMA hi = base_hi + 4
