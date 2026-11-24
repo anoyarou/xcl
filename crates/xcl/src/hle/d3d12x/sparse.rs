@@ -1297,13 +1297,91 @@ pub fn queue() -> Option<ID3D12CommandQueue> {
     QUEUE.lock().unwrap().clone()
 }
 
+struct RbJob {
+    fence: ID3D12Fence,
+    value: u64,
+    ranges: Vec<(usize, usize)>,
+}
+
+// SAFETY: ID3D12Fence is a free-threaded COM object; ranges are plain data.
+unsafe impl Send for RbJob {}
+
+struct RbQueueState {
+    fence: ID3D12Fence,
+    value: u64,
+    tx: std::sync::mpsc::Sender<RbJob>,
+}
+
+unsafe impl Send for RbQueueState {}
+
+static RB_QUEUES: Mutex<Option<FxHashMap<usize, RbQueueState>>> = Mutex::new(None);
+
+unsafe fn wait_fence_ms(fence: &ID3D12Fence, target: u64, event: HANDLE, timeout_ms: u32) -> bool {
+    if target == 0 || fence.GetCompletedValue() >= target {
+        return true;
+    }
+    let _ = windows::Win32::System::Threading::ResetEvent(event);
+    if fence.SetEventOnCompletion(target, event).is_err() {
+        return fence.GetCompletedValue() >= target;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    while fence.GetCompletedValue() < target {
+        let rem = deadline.saturating_duration_since(std::time::Instant::now());
+        if rem.is_zero() {
+            return false;
+        }
+        let ms = rem.as_millis().clamp(1, u32::MAX as u128) as u32;
+        windows::Win32::System::Threading::WaitForSingleObject(event, ms);
+    }
+    true
+}
+
+fn spawn_rb_worker(queue_id: usize) -> std::sync::mpsc::Sender<RbJob> {
+    let (tx, rx) = std::sync::mpsc::channel::<RbJob>();
+    let name = format!("xcl-sparse-rb-{queue_id:x}");
+    let spawned = std::thread::Builder::new().name(name).spawn(move || unsafe {
+        let Ok(event) = windows::Win32::System::Threading::CreateEventW(None, false, false, None) else {
+            return;
+        };
+        for job in rx {
+            // Wait for the title queue outside `STATE` and without stalling `s.queue`:
+            // a queue may carry a wait-before-signal `Wait64BitValueX` whose producer has not
+            // been submitted yet on the caller's thread.
+            if !wait_fence_ms(&job.fence, job.value, event, 5000) {
+                static LATE: AtomicU64 = AtomicU64::new(0);
+                let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
+                if k.is_power_of_two() {
+                    crate::xlog_warn!(
+                        "sparse: async readback for queue {queue_id:#x} timed out after 5000 ms (fence at {}, wanted {})",
+                        job.fence.GetCompletedValue(),
+                        job.value
+                    );
+                }
+                continue;
+            }
+            let mut g = STATE.lock().unwrap();
+            if let Some(s) = g.as_mut() {
+                s.readback_ranges(&job.ranges);
+            }
+        }
+        let _ = CloseHandle(event);
+    });
+    if let Err(e) = spawned {
+        crate::xlog_error!("sparse: failed to spawn readback thread for queue {queue_id:#x}: {e}");
+    }
+    tx
+}
+
+/// Schedule an asynchronous readback of GPU-written sparse ranges after `queue` finishes its
+/// submission. Never blocks the submitter thread or stalls `sparse::State::queue`, avoiding
+/// CPU/GPU deadlocks when `queue` carries a wait-before-signal `Wait64BitValueX` whose producer
+/// is submitted later on the same thread.
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
     if ranges.is_empty() {
         return;
     }
-    let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return };
-    let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && u.is_sparse(a)).collect();
     if filtered.is_empty() {
         return;
     }
@@ -1318,12 +1396,30 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
             _ => merged.push((a, n)),
         }
     }
-    s.rb_value += 1;
-    let v = s.rb_value;
-    if queue.Signal(&s.rb_fence, v).is_ok() {
-        let _ = s.queue.Wait(&s.rb_fence, v);
-    }
-    s.readback_ranges(&merged);
+    let qid = queue.as_raw() as usize;
+    let (tx, job) = {
+        let mut g = RB_QUEUES.lock().unwrap();
+        let m = g.get_or_insert_with(FxHashMap::default);
+        let entry = match m.entry(qid) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let mut dev: Option<ID3D12Device> = None;
+                if queue.GetDevice(&mut dev).is_err() {
+                    return;
+                }
+                let Some(dev) = dev else { return };
+                let Ok(fence) = super::real::create_raw_fence(&dev) else { return };
+                let tx = spawn_rb_worker(qid);
+                v.insert(RbQueueState { fence, value: 0, tx })
+            }
+        };
+        entry.value += 1;
+        if queue.Signal(&entry.fence, entry.value).is_err() {
+            return;
+        }
+        (entry.tx.clone(), RbJob { fence: entry.fence.clone(), value: entry.value, ranges: merged })
+    };
+    let _ = tx.send(job);
 }
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
@@ -2388,6 +2484,54 @@ mod tests {
             }
             let decommit = t.elapsed();
             println!("early: {n} pages: commit {:.1} ms, decommit {:.1} ms", commit.as_secs_f64() * 1e3, decommit.as_secs_f64() * 1e3);
+        }
+    }
+
+    /// `readback_after_execute` must return immediately even when `queue` is blocked on an
+    /// unsignaled GPU fence (wait-before-signal `Wait64BitValueX`), rather than deadlocking the
+    /// submitter thread and `sparse::State::queue` for 5 seconds.
+    #[test]
+    fn readback_after_execute_does_not_block_on_stalled_queue() {
+        unsafe {
+            if super::super::real::init().is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let Some(dev) = STATE.lock().unwrap().as_ref().map(|s| s.dev.clone()) else {
+                crate::gpu::recomp::runner::skip_test("no sparse state");
+                return;
+            };
+            let Some((va, _len)) = alloc(TILE, TILE) else {
+                crate::gpu::recomp::runner::skip_test("no sparse UMA");
+                return;
+            };
+            assert!(crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va)), "allocated VA must be sparse");
+
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() })
+                .expect("compute queue");
+            let gate = super::super::real::create_raw_fence(&dev).expect("gate fence");
+            queue.Wait(&gate, 1).expect("queue.Wait");
+
+            let started = std::time::Instant::now();
+            readback_after_execute(&queue, &[(va, 64)]);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "readback_after_execute blocked submitter thread on stalled queue ({:?})",
+                started.elapsed()
+            );
+            assert!(STATE.try_lock().is_ok(), "STATE must not remain locked while stalled queue waits");
+
+            // Release the stalled queue so the async readback worker drains cleanly.
+            gate.Signal(1).expect("gate.Signal");
+            let done = super::super::real::create_raw_fence(&dev).expect("done fence");
+            queue.Signal(&done, 1).expect("queue.Signal");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while done.GetCompletedValue() < 1 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(done.GetCompletedValue() >= 1, "queue did not drain after gate signaled");
+            assert!(free(va), "free sparse test allocation");
         }
     }
 }
