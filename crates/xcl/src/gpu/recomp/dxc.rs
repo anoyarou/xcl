@@ -477,6 +477,38 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
+/// HLSL over this size is compiled at -O0 and one at a time (`compile_here`).
+const ENORMOUS_SOURCE: usize = 8 * 1024 * 1024;
+static ENORMOUS_ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A compile's turn among enormous sources (`compile_here`): held for the whole DXC call.
+struct EnormousTurn(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl EnormousTurn {
+    fn wanted(src: &str) -> bool {
+        #[cfg(test)]
+        if src.contains(enormous_tests::MARK) {
+            return true;
+        }
+        src.len() > ENORMOUS_SOURCE
+    }
+
+    fn take() -> EnormousTurn {
+        let guard = ENORMOUS_ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        enormous_tests::entered();
+        EnormousTurn(guard)
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnormousTurn {
+    fn drop(&mut self) {
+        // before the field: the next compile can only start once this one is counted out
+        enormous_tests::left();
+    }
+}
+
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
@@ -487,8 +519,13 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // compile). -O0 only as a safety net for enormous sources.
     // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
     // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
+    // Enormous sources (over ENORMOUS_SOURCE, a handful in a retail pack) one at a time: each takes
+    // GBs in DXC, and the commit checks that hold compiles back (`wait_for_memory`) do not see that
+    // under Wine, where the commit limit includes all of the host's swap. Three of them at once
+    // took 29 GB of RAM and 20 GB of swap in `xcl pipelines` on a 32 GB machine.
+    let _enormous = EnormousTurn::wanted(src).then(EnormousTurn::take);
     if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 8 * 1024 * 1024 {
+        if src.len() > ENORMOUS_SOURCE {
             args.push(crate::util::wide("-O0"));
         } else if src.len() > 1024 * 1024 {
             args.push(crate::util::wide("-O1"));
@@ -1284,5 +1321,54 @@ mod cache_tests {
             release_tx.send(()).unwrap();
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod enormous_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// In test builds a source with this comment counts as enormous (`EnormousTurn::wanted`), so the
+    /// test needs no 8 MB shader.
+    pub(super) const MARK: &str = "// xcl-test: enormous source";
+    static INSIDE: AtomicUsize = AtomicUsize::new(0);
+    static MOST_INSIDE: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn entered() {
+        let n = INSIDE.fetch_add(1, Ordering::SeqCst) + 1;
+        MOST_INSIDE.fetch_max(n, Ordering::SeqCst);
+    }
+
+    pub(super) fn left() {
+        INSIDE.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Enormous sources compiled from several threads at once go through DXC one at a time.
+    #[test]
+    fn enormous_sources_compile_one_at_a_time() {
+        if compiler().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let threads: Vec<_> = (0..4u32)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    // distinct sources, each with a little work for DXC
+                    let mut src = format!("{MARK}\nRWByteAddressBuffer o : register(u0);\n[numthreads(64, 1, 1)]\nvoid main(uint3 t : SV_DispatchThreadID) {{\n    uint v = t.x * {};\n", i + 3);
+                    for k in 0..200 {
+                        src.push_str(&format!("    v = (v ^ {k}u) * 2654435761u + (v >> {});\n", k % 31 + 1));
+                    }
+                    src.push_str("    o.Store(t.x * 4, v);\n}\n");
+                    compile_here(&src, "main", "cs_6_6", &[]).map(|d| d.len())
+                })
+            })
+            .collect();
+        for t in threads {
+            let dxil = t.join().unwrap().expect("the test shader compiles");
+            assert!(dxil > 0);
+        }
+        assert_eq!(INSIDE.load(Ordering::SeqCst), 0);
+        assert_eq!(MOST_INSIDE.load(Ordering::SeqCst), 1, "two enormous sources were in DXC at once");
     }
 }
