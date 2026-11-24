@@ -222,15 +222,10 @@ pub mod mirrors {
 /// The console's MEM_64K_PAGES (MEM_LARGE_PAGES | MEM_PHYSICAL): title memory of 64 KiB
 /// pages – GPU-visible on the console like all title memory.
 const MEM_64K_PAGES: u32 = 0x2040_0000;
-/// MEM_LARGE_PAGES: the console's 2 MiB pages of title memory (alone, or in MEM_64K_PAGES)
-const MEM_LARGE_PAGES_X: u32 = 0x2000_0000;
-/// a protection bit of the console's title memory the GPU uses (GTA VI's index and vertex data:
-/// 0x22004; its 2.2 GB block of other data: 0x2404)
-const PAGE_GPU_X: u32 = 0x2_0000;
 
 /// Commit `[a, a + n)` of a sparse window (the title's reservations there) and give it video
 /// memory (`d3d12x::sparse`).
-pub(crate) unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
+unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
     let q = mem::VirtualAlloc(a as *const c_void, n, mem::MEM_COMMIT, sanitize_protect(p));
     if !q.is_null() {
         crate::hle::d3d12x::sparse::committed(q as usize, n);
@@ -250,20 +245,14 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         trace_mem("VirtualAlloc (sparse commit)", addr as usize, size, t as u64, p, q as usize);
         return q;
     }
-    // the title's own reservations of 64 KiB or large pages: in a sparse window, so the GPU sees
-    // them (GTA VI keeps index and vertex data in a 1.2 GB VirtualAlloc of large pages; outside
-    // the windows the GPU faulted on it – a driver timeout)
-    let large = t & MEM_64K_PAGES != MEM_64K_PAGES && t & MEM_LARGE_PAGES_X != 0 && p & PAGE_GPU_X != 0;
-    if addr.is_null() && t & 0x2000 != 0 && (t & MEM_64K_PAGES == MEM_64K_PAGES || large) {
-        // (large pages: from the highest window down – the title's physical pages, gigabytes
-        // in one piece, keep the lower ones)
-        let top = |u: &crate::gpu::uma::Uma| (1..crate::gpu::uma::MAX_WINDOWS).rev().find_map(|k| u.sparse_alloc_in(k, size, crate::gpu::uma::GRAIN).map(|(q, _)| q));
-        if let Some(q) = uma.and_then(|u| if large { top(u).or_else(|| u.sparse_reserve(size)) } else { u.sparse_reserve(size) }) {
+    // the title's own reservations of 64 KiB pages: in a sparse window, so the GPU sees them
+    if addr.is_null() && t & 0x2000 != 0 && t & MEM_64K_PAGES == MEM_64K_PAGES {
+        if let Some(q) = uma.and_then(|u| u.sparse_reserve(size)) {
             if t & 0x1000 != 0 && commit_sparse(q, size, p).is_null() {
                 uma.map(|u| u.sparse_release(q));
                 return std::ptr::null_mut();
             }
-            trace_mem("VirtualAlloc (sparse reserve)", 0, size, t as u64, p, q);
+            trace_mem("VirtualAlloc (64K pages, sparse)", 0, size, t as u64, p, q);
             return q as *mut c_void;
         }
     }
@@ -328,13 +317,6 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             if let Some(q) = u.committed_window().filter(|_| fits).and_then(|k| u.alloc_in(k, size, align)) {
                 trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
                 return q as *mut c_void;
-            }
-            if crate::util::under_wine() {
-                let rounded = size.max(1).div_ceil(align) * align;
-                if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
-                    trace_mem("VirtualAlloc (graphics, sparse VRAM fallback)", 0, rounded, t as u64, p, q);
-                    return q as *mut c_void;
-                }
             }
         }
     }
@@ -756,18 +738,10 @@ fn process_private_bytes() -> u64 {
         c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
         if K32GetProcessMemoryInfo(thr::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb) != 0 {
             // Wine fills the fields before PrivateUsage only; PagefileUsage is the same number
-            // on Windows (the commit charge). On Wine on Linux, PagefileUsage can also be 0, so
-            // fall back to WorkingSetSize or a non-zero baseline.
-            let bytes = if c.PrivateUsage != 0 {
-                c.PrivateUsage as u64
-            } else if c.PagefileUsage != 0 {
-                c.PagefileUsage as u64
-            } else {
-                c.WorkingSetSize as u64
-            };
-            if bytes != 0 { bytes } else { 64 * 1024 * 1024 }
+            // on Windows (the commit charge)
+            if c.PrivateUsage != 0 { c.PrivateUsage as u64 } else { c.PagefileUsage as u64 }
         } else {
-            64 * 1024 * 1024
+            0
         }
     }
 }
@@ -1411,25 +1385,38 @@ fn hresult_to_win32(hr: i32) -> u32 {
 const SLEEP_STEP_MS: u32 = 20;
 /// how often a sleep looks whether the title is still held
 const SLEEP_HELD_POLL_MS: u32 = 5;
+/// the shortest sleep that is a wait for time: a shorter one is a poll and is passed on as it is
+const SLEEP_HOLD_MIN_MS: u32 = 100;
 
 /// Sleep(ms): `ms` of the title's time. The time XCL holds one of the title's threads in a bind
 /// for a pipeline still being built (`pso_async::title_held`) is not the title's: a console
 /// title never waits there. A retail title's own stall check – a thread that ticks once a second
 /// with Sleep and ends the process after 30 ticks without a sign of its main thread – ended it
-/// while the driver built the pipelines of its world (#505, #232). `XCL_SLEEP_HOLD=0`: the PC's
+/// while the driver built the pipelines of its world (#505, #232). Only a sleep of
+/// `SLEEP_HOLD_MIN_MS` or more is taken so: a thread that polls with short sleeps (streaming,
+/// sound) goes on while a bind waits. `XCL_SLEEP_HOLD=<ms>` sets that length, `0`: the PC's
 /// Sleep as it is.
 pub unsafe extern "system" fn Sleep(ms: u32) {
-    static HOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*HOLD.get_or_init(|| std::env::var("XCL_SLEEP_HOLD").map_or(true, |v| v.trim() != "0")) {
+    static MIN: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let Some(min) = *MIN.get_or_init(|| sleep_hold_min(std::env::var("XCL_SLEEP_HOLD").ok().as_deref())) else {
         return thr::Sleep(ms);
-    }
-    title_sleep(ms, |ms| thr::Sleep(ms), crate::hle::d3d12x::pso_async::title_held)
+    };
+    title_sleep(ms, min, |ms| thr::Sleep(ms), crate::hle::d3d12x::pso_async::title_held)
 }
 
-/// `ms` of time in which the title was not `held`, slept through `sleep` (a yield and an endless
-/// sleep as they are).
-fn title_sleep(ms: u32, sleep: impl Fn(u32), held: impl Fn() -> bool) {
-    if ms == 0 || ms == thr::INFINITE {
+/// `XCL_SLEEP_HOLD`: the shortest sleep whose held time is not counted (`None`: no sleep).
+fn sleep_hold_min(v: Option<&str>) -> Option<u32> {
+    match v.map(str::trim) {
+        None => Some(SLEEP_HOLD_MIN_MS),
+        Some("0") => None,
+        Some(v) => Some(v.parse().unwrap_or(SLEEP_HOLD_MIN_MS)),
+    }
+}
+
+/// `ms` of time in which the title was not `held`, slept through `sleep` (a yield, an endless
+/// sleep and one shorter than `min` as they are).
+fn title_sleep(ms: u32, min: u32, sleep: impl Fn(u32), held: impl Fn() -> bool) {
+    if ms == 0 || ms == thr::INFINITE || ms < min {
         return sleep(ms);
     }
     let mut left = std::time::Duration::from_millis(ms as u64);
@@ -1979,7 +1966,7 @@ mod tests {
                 real_sleep(300);
                 held.store(false, Ordering::Release);
             });
-            title_sleep(60, real_sleep, || held.load(Ordering::Acquire));
+            title_sleep(60, 60, real_sleep, || held.load(Ordering::Acquire));
         });
         let took = start.elapsed();
         assert!(took >= std::time::Duration::from_millis(355), "back after {took:?}: the 300 ms held were counted");
@@ -1996,9 +1983,9 @@ mod tests {
                 real_sleep(50);
                 held.store(true, Ordering::Release);
                 real_sleep(300);
-                held.store(false, Ordering::Acquire);
+                held.store(false, Ordering::Release);
             });
-            title_sleep(200, real_sleep, || held.load(Ordering::Acquire));
+            title_sleep(200, SLEEP_HOLD_MIN_MS, real_sleep, || held.load(Ordering::Acquire));
         });
         let took = start.elapsed();
         // 200 ms of its own, less at most one step counted while held, and the 300 ms held
@@ -2016,19 +2003,33 @@ mod tests {
                 real_sleep(ms);
             }
         };
-        title_sleep(0, sleep, || false);
-        title_sleep(thr::INFINITE, sleep, || false);
+        title_sleep(0, 1, sleep, || false);
+        title_sleep(thr::INFINITE, 1, sleep, || false);
         assert_eq!(*calls.borrow(), [0, thr::INFINITE]);
         calls.borrow_mut().clear();
         let t = std::time::Instant::now();
-        title_sleep(50, sleep, || false);
+        title_sleep(50, 1, sleep, || false);
         let took = t.elapsed();
         assert!(took >= std::time::Duration::from_millis(50) && took < std::time::Duration::from_millis(400), "took {took:?}");
         assert!(calls.borrow().iter().all(|&ms| (1..=SLEEP_STEP_MS).contains(&ms)), "{:?}", calls.borrow());
         // a sleep shorter than a step is one sleep, as before
         calls.borrow_mut().clear();
-        title_sleep(1, sleep, || false);
+        title_sleep(1, 1, sleep, || false);
         assert_eq!(*calls.borrow(), [1]);
+    }
+
+    /// A sleep shorter than the shortest one held is a poll: it is passed on as it is, also
+    /// while the title is held. `XCL_SLEEP_HOLD` sets that length, `0` takes no sleep.
+    #[test]
+    fn a_short_sleep_is_passed_on_while_the_title_is_held() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let sleep = |ms: u32| calls.borrow_mut().push(ms);
+        title_sleep(SLEEP_HOLD_MIN_MS - 1, SLEEP_HOLD_MIN_MS, sleep, || true);
+        assert_eq!(*calls.borrow(), [SLEEP_HOLD_MIN_MS - 1]);
+        assert_eq!(sleep_hold_min(None), Some(SLEEP_HOLD_MIN_MS));
+        assert_eq!(sleep_hold_min(Some("0")), None);
+        assert_eq!(sleep_hold_min(Some(" 250 ")), Some(250));
+        assert_eq!(sleep_hold_min(Some("on")), Some(SLEEP_HOLD_MIN_MS));
     }
 
     #[test]
