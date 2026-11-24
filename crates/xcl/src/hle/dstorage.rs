@@ -3014,7 +3014,4 @@ mod tests {
             status_release(s);
         }
     }
-            status_release(s);
-        }
-    }
 }
