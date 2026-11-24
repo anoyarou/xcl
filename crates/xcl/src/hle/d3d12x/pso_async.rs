@@ -65,7 +65,29 @@ pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
 /// A worker's build of `p` (`preload`: by one of the lowest-priority workers).
 fn build(p: &Arc<Pending>, job: Job, preload: bool) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
+    struct Guard<'a> {
+        p: &'a Arc<Pending>,
+        preload: bool,
+        completed: bool,
+    }
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            if !self.completed {
+                complete(self.p, 0);
+            }
+            if self.preload {
+                // (under the lock: `want` does not raise this thread after it)
+                let mut d = self.p.demand.lock().unwrap_or_else(|e| e.into_inner());
+                d.preload_thread = 0;
+                if d.wanted {
+                    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
+                }
+            }
+            BUILDING.with(|b| *b.borrow_mut() = None);
+        }
+    }
     BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
+    let mut guard = Guard { p, preload, completed: false };
     if preload {
         let mut d = p.demand.lock().unwrap();
         d.preload_thread = unsafe { GetCurrentThreadId() };
@@ -73,16 +95,15 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
-    complete(p, job());
-    if preload {
-        // (under the lock: `want` does not raise this thread after it)
-        let mut d = p.demand.lock().unwrap();
-        d.preload_thread = 0;
-        if d.wanted {
-            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
+    let real = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || job())) {
+        Ok(r) => r,
+        Err(_) => {
+            crate::xlog_warn!("D3D12.X: pipeline build panicked on worker");
+            0
         }
-    }
-    BUILDING.with(|b| *b.borrow_mut() = None);
+    };
+    complete(p, real);
+    guard.completed = true;
 }
 
 impl Pending {
@@ -137,6 +158,30 @@ fn complete(p: &Pending, real: usize) {
 }
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
+/// binds waiting right now for a pipeline still being built (`title_held`)
+static HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a bind is waiting for a pipeline still being built: one of the title's threads is
+/// held where a console title never waits (`kernelx::Sleep` does not count that time).
+pub fn title_held() -> bool {
+    HELD.load(Ordering::Acquire) != 0
+}
+
+/// A bind's wait for a pipeline still being built (`title_held`).
+struct Held;
+
+impl Held {
+    fn new() -> Held {
+        HELD.fetch_add(1, Ordering::AcqRel);
+        Held
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        HELD.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub fn enabled() -> bool {
     std::env::var("XCL_ASYNC_PSO").map_or(true, |v| v != "0")
@@ -162,6 +207,26 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
                 if let Some(job) = job {
                     build(&p, job, false);
                 }
+            });
+        }
+        Mutex::new(tx)
+    })
+}
+
+/// Dedicated 64 MiB-stack workers for `resolve_wait_for` so a bind never runs heavy shader
+/// translation inline on a 1 MiB title thread and never queues behind speculative graphics builds.
+fn urgent_queue() -> &'static Mutex<mpsc::Sender<(Arc<Pending>, Job)>> {
+    static Q: OnceLock<Mutex<mpsc::Sender<(Arc<Pending>, Job)>>> = OnceLock::new();
+    Q.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<(Arc<Pending>, Job)>();
+        let rx = Arc::new(Mutex::new(rx));
+        let n = crate::gpu::recomp::dxc::compile_threads().clamp(4, 16);
+        for k in 0..n {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-wait-{k}")).stack_size(64 << 20).spawn(move || loop {
+                let next = rx.lock().unwrap().recv();
+                let Ok((p, job)) = next else { return };
+                build(&p, job, false);
             });
         }
         Mutex::new(tx)
@@ -362,6 +427,56 @@ fn preload() -> Option<&'static Preload> {
 mod used_tests {
     use super::*;
 
+    /// While a bind waits for a pipeline still being built, the title is held (`title_held`):
+    /// `kernelx::Sleep` does not count that time.
+    #[test]
+    fn a_bind_waiting_for_a_build_holds_the_title() {
+        let standin = 0x7E57_B002usize;
+        let (started, building) = mpsc::channel();
+        let (go, finish) = mpsc::channel::<()>();
+        submit_lazy(standin, true, Box::new(move || {
+            let _ = started.send(());
+            let _ = finish.recv();
+            0x5252
+        }), 0);
+        let bind = std::thread::spawn(move || resolve_wait_for(standin, None));
+        building.recv_timeout(std::time::Duration::from_secs(10)).expect("the pipeline is being built");
+        // (built in the bind, or by a worker with the bind about to wait for it)
+        let t = std::time::Instant::now();
+        while !title_held() && t.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(title_held(), "a bind waits for a build, but the title is not held");
+        go.send(()).unwrap();
+        assert_eq!(bind.join().unwrap(), 0x5252);
+        let _ = released(standin);
+    }
+
+    /// `resolve_wait_for` offloads unstarted builds to a 64 MiB worker thread (`xcl-pso-wait-*`)
+    /// rather than running inline on a title thread, marks them wanted, and wakes waiters even if
+    /// the build unwinds.
+    #[test]
+    fn resolve_wait_offloads_to_worker_and_recovers_from_panic() {
+        let standin = 0x7E57_B006usize;
+        let caller = std::thread::current().id();
+        let (tx, rx) = mpsc::channel();
+        submit_lazy(standin, true, Box::new(move || {
+            let _ = tx.send((std::thread::current().id(), build_is_wanted()));
+            0x5656
+        }), 0);
+        assert_eq!(resolve_wait_for(standin, None), 0x5656);
+        let (worker, wanted) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("worker ran job");
+        assert_ne!(worker, caller, "resolve_wait_for must offload builds to a worker thread");
+        assert!(wanted, "offloaded build sees wanted == true");
+        let _ = released(standin);
+
+        let panicking = 0x7E57_B007usize;
+        submit_lazy(panicking, true, Box::new(|| -> usize { panic!("intentional pso panic") }), 0);
+        assert_eq!(resolve_wait_for(panicking, None), panicking);
+        assert!(!is_pending(panicking), "panicking build must complete and wake waiters");
+        let _ = released(panicking);
+    }
+
     /// A bind waits for a pipeline still being built no longer than its budget and goes on with
     /// the stand-in; later binds do not wait for it again; once built it is the real one.
     #[test]
@@ -480,8 +595,9 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
-/// `resolve`, waiting for a pipeline still being built – built here if no worker has started
-/// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
+/// `resolve`, waiting for a pipeline still being built – offloaded to a 64 MiB worker if no worker
+/// has started it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds
+/// now, and shader translation recurses too deeply for a 1 MiB title stack).
 pub fn resolve_wait(pso: usize) -> usize {
     resolve_wait_for(pso, wait_budget())
 }
@@ -490,14 +606,17 @@ pub fn resolve_wait(pso: usize) -> usize {
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
+    // (the title's thread is held from here until the pipeline is built or the budget is over)
+    let _held = (!*p.done.lock().unwrap()).then(Held::new);
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
-    let job = p.job.lock().unwrap().take();
-    if let Some(job) = job {
-        complete(&p, job());
-    }
     p.want();
+    if let Some(job) = p.job.lock().unwrap().take() {
+        if let Err(mpsc::SendError((p, job))) = urgent_queue().lock().unwrap().send((p.clone(), job)) {
+            build(&p, job, false);
+        }
+    }
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
