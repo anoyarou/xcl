@@ -795,27 +795,6 @@ fn coverage(agg: &Agg, order: &[String], ks: &[usize]) -> Vec<(usize, usize)> {
     ks.iter().map(|&k| (k, max_rank.iter().filter(|&&r| r <= k).count())).collect()
 }
 
-/// `xcl pso-precompile <game> [--threads N]`: `--precompile --pipelines` of the game's shader
-/// package (`shaders.rpf` in its folder), so its run does not wait for the driver's compiles.
-pub fn pso_precompile(game: &Path, args: &[String]) -> i32 {
-    let Some(pack) = shader_package(game) else {
-        eprintln!("xcl pso-precompile: no shaders.rpf in {}", game.display());
-        return 2;
-    };
-    let mut all = vec!["--precompile".to_string(), "--pipelines".to_string()];
-    all.extend(args.iter().cloned());
-    run(&pack, &all)
-}
-
-/// A game's shader package: the path itself when it is a file, else `shaders.rpf` in the folder.
-fn shader_package(game: &Path) -> Option<std::path::PathBuf> {
-    if game.is_file() {
-        return Some(game.to_path_buf());
-    }
-    let p = game.join("shaders.rpf");
-    p.is_file().then_some(p)
-}
-
 pub fn run(path: &Path, args: &[String]) -> i32 {
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok());
     // a flag that needs a value: missing, or another flag in its place, is an error
@@ -915,27 +894,11 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--precompile") {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
         let pipelines = args.iter().any(|a| a == "--pipelines");
-        if let Some(n) = opt("--threads") {
-            PIPELINE_THREADS.store(n.max(1), Ordering::Relaxed);
-        }
+        // `--used-only`: only the compute programs whose pipelines an earlier run of a title used
+        let used = args.iter().any(|a| a == "--used-only").then(crate::hle::d3d12x::pso_async::earlier_used_keys);
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
-        // `--records FILE` (record hashes or pipeline keys, a hexadecimal one a line) and / or
-        // `--used` (the pipelines an earlier run used): only those programs
-        let mut select: Option<std::collections::HashSet<u64>> = None;
-        if let Some(f) = args.iter().position(|a| a == "--records").and_then(|i| args.get(i + 1)) {
-            match std::fs::read_to_string(f) {
-                Ok(t) => select.get_or_insert_with(Default::default).extend(parse_used(&t)),
-                Err(e) => {
-                    eprintln!("xcl shaders --records {f}: {e}");
-                    return 2;
-                }
-            }
-        }
-        if args.iter().any(|a| a == "--used") {
-            select.get_or_insert_with(Default::default).extend(used_earlier());
-        }
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), select.as_ref(), pipelines, t0);
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used.as_ref(), t0);
     }
     if args.iter().any(|a| a == "--direct") {
         return direct_sweep(&input, args, top, json, t0);
@@ -1154,9 +1117,7 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
 /// mesh pass-through, which the runtime builds for its pixel shader.
 /// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
 /// ABI root signature with its static samplers). Save the driver's compiled blob in the same
-/// cache the runtime reads at startup. Nothing runs on the GPU. Made once all are translated:
-/// the ones an earlier run used first, biggest first, on `pipeline_threads` (`--threads N`);
-/// a pipeline whose blob is kept already is only loaded from it (resumable).
+/// cache the runtime reads at startup. Nothing runs on the GPU.
 /// Programs whose DXIL is over `XCL_PIPELINE_MAX_KB` (8 MiB by default; 0 turns the cap off)
 /// and that have no blob yet are counted as capped and left to the runtime: their driver
 /// compile takes tens of minutes and gigabytes, and stopped the pass on the biggest programs
@@ -1170,7 +1131,7 @@ struct Pipelines {
     /// programs over `max_dxil` with no blob yet, and their DXIL bytes
     capped: AtomicUsize,
     capped_bytes: AtomicUsize,
-    /// driver compiles running and the most at once (`pipeline_threads`): each of the
+    /// driver compiles running and the most at once (`XCL_PIPELINE_THREADS`, 4): each of the
     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
     running: (Mutex<usize>, std::sync::Condvar),
     most: usize,
@@ -1253,19 +1214,18 @@ impl Pipelines {
             let sel = crate::gpu::adapter::Selector::from_env_or("auto");
             let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
-            let most = pipeline_threads();
+            let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
             let max_dxil = pipeline_cap_kb(std::env::var("XCL_PIPELINE_MAX_KB").ok().as_deref()).saturating_mul(1024);
             Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), capped: AtomicUsize::new(0), capped_bytes: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most, max_dxil })
         }
     }
 
-    /// The compute pipeline of `c` (made and released): the driver's time and whether it came
-    /// from a kept blob, None when refused or capped.
-    fn make(&self, c: &recomp::pso::Compiled) -> Option<(std::time::Duration, bool)> {
-        self.make_with_cache_path(c, None)
+    /// The compute pipeline of `c` (made and released).
+    fn make(&self, c: &recomp::pso::Compiled) {
+        self.make_with_cache_path(c, None);
     }
 
-    fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) -> Option<(std::time::Duration, bool)> {
+    fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
         let rs = {
@@ -1279,7 +1239,7 @@ impl Pipelines {
                     }
                     Err(_) => {
                         self.refused.fetch_add(1, Ordering::Relaxed);
-                        return None;
+                        return;
                     }
                 },
             }
@@ -1300,7 +1260,7 @@ impl Pipelines {
             self.capped.fetch_add(1, Ordering::Relaxed);
             self.capped_bytes.fetch_add(c.dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-            return None;
+            return;
         }
         {
             let mut n = self.running.0.lock().unwrap();
@@ -1309,7 +1269,6 @@ impl Pipelines {
             }
             *n += 1;
         }
-        let started = std::time::Instant::now();
         let from_cache = cached.as_ref().and_then(|bytes| {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
             // a driver that cannot use the blob may compile from the DXIL itself and still
@@ -1318,7 +1277,6 @@ impl Pipelines {
                 .ok()
                 .filter(|pso| unsafe { pso.GetCachedBlob() }.is_ok_and(|b| unsafe { b.GetBufferSize() } == bytes.len()))
         });
-        let reused = from_cache.is_some();
         // A stale blob is not a usable cache hit. Do not let its presence bypass the offline
         // size cap and start the expensive uncached driver compile.
         if cached.is_some() && from_cache.is_none() && over_cap {
@@ -1330,7 +1288,7 @@ impl Pipelines {
             self.capped.fetch_add(1, Ordering::Relaxed);
             self.capped_bytes.fetch_add(c.dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-            return None;
+            return;
         }
         let r = if let Some(pso) = from_cache {
             self.reused.fetch_add(1, Ordering::Relaxed);
@@ -1349,197 +1307,26 @@ impl Pipelines {
             }
             pso
         };
-        let took = started.elapsed();
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-        match r {
-            Ok(_) => {
-                self.made.fetch_add(1, Ordering::Relaxed);
-                Some((took, reused))
-            }
-            Err(_) => {
-                self.refused.fetch_add(1, Ordering::Relaxed);
-                None
-            }
+        let done = match r {
+            Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
+            Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
+        };
+        if done % 25 == 0 {
+            eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
         }
     }
 }
 
-/// `--threads N`: driver compiles at once for `--pipelines` (0: `pipeline_threads`' default).
-static PIPELINE_THREADS: AtomicUsize = AtomicUsize::new(0);
-
-/// Driver compiles at once for `--pipelines`: `--threads`, `XCL_PIPELINE_THREADS`, or else one
-/// a core but no more than one per 2 GB of physical memory. The biggest programs take the
-/// driver ~1.5 GB each; a retail game's hundreds of 0.1 - 1 MB DXIL programs take it 1 - 120 s
-/// each, so the warm-up is bound by how many run at once (4 before).
-fn pipeline_threads() -> usize {
-    let set = PIPELINE_THREADS.load(Ordering::Relaxed);
-    if set != 0 {
-        return set;
-    }
-    if let Some(n) = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
-        return n.max(1);
-    }
-    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    default_pipeline_threads(cores, physical_memory_gb())
+/// A compute program a title used in an earlier run (`--used-only`): its pipeline's key, as the
+/// runtime notes it (`real::shaders_key` of the one shader), is among `used`.
+fn used_compute(blob: &[u8], used: &std::collections::HashSet<u64>) -> bool {
+    used.contains(&crate::hle::d3d12x::real::shaders_key(&[blob.to_vec()]))
 }
 
-fn default_pipeline_threads(cores: usize, memory_gb: Option<u64>) -> usize {
-    let by_memory = memory_gb.map_or(4, |gb| (gb / 2) as usize);
-    cores.min(by_memory).clamp(1, 32)
-}
-
-fn physical_memory_gb() -> Option<u64> {
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullTotalPhys >> 30)
-}
-
-/// The keys of the pipelines an earlier run used (`used-pipelines.txt` beside the DXIL cache,
-/// written by the runtime's `pso_async::used`); a compute pipeline's key is
-/// `real::shaders_key` of its console program.
-fn used_earlier() -> std::collections::HashSet<u64> {
-    parse_used(&std::fs::read_to_string(recomp::dxc::cache_dir().join("used-pipelines.txt")).unwrap_or_default())
-}
-
-fn parse_used(text: &str) -> std::collections::HashSet<u64> {
-    text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).filter(|&k| k != 0).collect()
-}
-
-/// A compute pipeline waiting for the driver.
-struct PipelineJob {
-    /// an earlier run of the title used it (`used_earlier`)
-    used: bool,
-    compiled: recomp::pso::Compiled,
-}
-
-/// The ones an earlier run used first (what the title's loading asks for), each group biggest
-/// first: the longest compiles do not start last and leave the other threads idle at the end.
-fn order_pipeline_jobs(jobs: &mut [PipelineJob]) {
-    jobs.sort_by(|a, b| b.used.cmp(&a.used).then(b.compiled.dxil.len().cmp(&a.compiled.dxil.len())));
-}
-
-/// Build `jobs` on `p`'s threads in `order_pipeline_jobs`' order: progress, the driver's time by
-/// DXIL size and the slowest at the end.
-fn make_pipelines(p: &Pipelines, mut jobs: Vec<PipelineJob>, used_keys: usize, t0: std::time::Instant) {
-    order_pipeline_jobs(&mut jobs);
-    let used = jobs.iter().filter(|j| j.used).count();
-    println!("pipelines: {} compute programs ({used} of the {used_keys} pipelines an earlier run used: first), {} driver compiles at once", jobs.len(), p.most);
-    let next = AtomicUsize::new(0);
-    let done = AtomicUsize::new(0);
-    // (driver ms, DXIL bytes, cache file name, from the cache)
-    let times: Mutex<Vec<(u128, usize, String, bool)>> = Mutex::new(Vec::new());
-    let started = std::time::Instant::now();
-    std::thread::scope(|s| {
-        for _ in 0..p.most {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(j) = jobs.get(i) else { break };
-                let r = p.make(&j.compiled);
-                if let Some((took, reused)) = r {
-                    let name = crate::hle::d3d12x::real::driver_cache::name(&j.compiled.dxil, 0);
-                    times.lock().unwrap().push((took.as_millis(), j.compiled.dxil.len(), name, reused));
-                }
-                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                let slow = r.filter(|(t, reused)| !reused && t.as_secs() >= 10);
-                if d % 50 == 0 || d == jobs.len() || slow.is_some() {
-                    eprintln!(
-                        "  pipelines {d}/{} ({} from the driver cache, {} refused; {:.0} s){}",
-                        jobs.len(),
-                        p.reused.load(Ordering::Relaxed),
-                        p.refused.load(Ordering::Relaxed),
-                        t0.elapsed().as_secs_f64(),
-                        slow.map_or(String::new(), |(t, _)| format!(" – {} B DXIL took the driver {:.1} s", j.compiled.dxil.len(), t.as_secs_f64()))
-                    );
-                }
-            });
-        }
-    });
-    let mut times = times.into_inner().unwrap();
-    times.retain(|t| !t.3);
-    let total: u128 = times.iter().map(|t| t.0).sum();
-    println!("pipelines: {} compiled by the driver ({:.0} s of driver time) in {:.1} s", times.len(), total as f64 / 1000.0, started.elapsed().as_secs_f64());
-    for (lo, hi) in [(0usize, 64usize << 10), (64 << 10, 256 << 10), (256 << 10, 512 << 10), (512 << 10, usize::MAX)] {
-        let b: Vec<_> = times.iter().filter(|t| t.1 >= lo && t.1 < hi).collect();
-        if !b.is_empty() {
-            let ms: u128 = b.iter().map(|t| t.0).sum();
-            let longest = b.iter().map(|t| t.0).max().unwrap_or(0);
-            println!("  DXIL from {:>4} KB: {:>5} pipelines, driver {:>7.1} s, longest {:.1} s", lo >> 10, b.len(), ms as f64 / 1000.0, longest as f64 / 1000.0);
-        }
-    }
-    times.sort_by(|a, b| b.0.cmp(&a.0));
-    for (ms, len, name, _) in times.iter().take(10) {
-        println!("  slowest: {name} ({len} B DXIL) {:.1} s", *ms as f64 / 1000.0);
-    }
-}
-
-#[cfg(test)]
-mod pipeline_tests {
-    use super::*;
-
-    fn job(used: bool, len: usize) -> PipelineJob {
-        PipelineJob { used, compiled: recomp::pso::Compiled { dxil: vec![0; len], samplers: Vec::new() } }
-    }
-
-    #[test]
-    fn pipelines_an_earlier_run_used_go_first_and_each_group_biggest_first() {
-        let mut jobs = vec![job(false, 10), job(true, 5), job(false, 900), job(true, 50)];
-        order_pipeline_jobs(&mut jobs);
-        let order: Vec<_> = jobs.iter().map(|j| (j.used, j.compiled.dxil.len())).collect();
-        assert_eq!(order, [(true, 50), (true, 5), (false, 900), (false, 10)]);
-    }
-
-    #[test]
-    fn the_shader_package_is_found_in_the_game_folder() {
-        let dir = std::env::temp_dir().join(format!("xcl-pso-pre-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(shader_package(&dir), None);
-        let pack = dir.join("shaders.rpf");
-        std::fs::write(&pack, b"RPF9").unwrap();
-        assert_eq!(shader_package(&dir).as_deref(), Some(pack.as_path()));
-        assert_eq!(shader_package(&pack).as_deref(), Some(pack.as_path()));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn records_select_programs_by_record_hash_or_pipeline_key() {
-        let (a, b, c) = (vec![1u8, 2, 3], vec![4u8, 5], vec![6u8]);
-        let set: std::collections::HashSet<u64> = [crate::gpu::shader::fnv64(&a), crate::hle::d3d12x::real::shaders_key(std::slice::from_ref(&b))].into();
-        assert!(selected(Some(&set), &a));
-        assert!(selected(Some(&set), &b));
-        assert!(!selected(Some(&set), &c));
-        assert!(selected(None, &c));
-    }
-
-    #[test]
-    fn driver_compiles_at_once_follow_the_cores_and_the_memory() {
-        assert_eq!(default_pipeline_threads(24, Some(128)), 24);
-        assert_eq!(default_pipeline_threads(24, Some(16)), 8);
-        assert_eq!(default_pipeline_threads(8, None), 4);
-        assert_eq!(default_pipeline_threads(64, Some(512)), 32);
-        assert_eq!(default_pipeline_threads(4, Some(1)), 1);
-    }
-
-    #[test]
-    fn used_pipeline_keys_are_read_as_the_runtime_writes_them() {
-        let keys = parse_used("00000000000000ab\nnot a key\n\n0000000000000000\n  ff00000000000001  \n");
-        assert_eq!(keys.len(), 2);
-        assert!(keys.contains(&0xab) && keys.contains(&0xff00_0000_0000_0001));
-        // a compute pipeline's key is that of its one console program
-        let blob = vec![1u8, 2, 3];
-        assert_ne!(crate::hle::d3d12x::real::shaders_key(std::slice::from_ref(&blob)), 0);
-    }
-}
-
-/// Whether `--records` / `--used` (`select`) takes the console program `blob`: by its record
-/// hash (`fnv64`, as the runtime's compile log names it) or its pipeline key (`used-pipelines.txt`).
-fn selected(select: Option<&std::collections::HashSet<u64>>, blob: &[u8]) -> bool {
-    select.is_none_or(|s| s.contains(&crate::gpu::shader::fnv64(blob)) || s.contains(&crate::hle::d3d12x::real::shaders_key(&[blob.to_vec()])))
-}
-
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, select: Option<&std::collections::HashSet<u64>>, pipelines: bool, t0: std::time::Instant) -> i32 {
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant) -> i32 {
     let pipelines = if pipelines {
         match Pipelines::new() {
             Ok(p) => Some(p),
@@ -1556,8 +1343,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let jobs: Mutex<Vec<PipelineJob>> = Mutex::new(Vec::new());
-    let used = if pipelines.is_some() { used_earlier() } else { Default::default() };
+    let unused = AtomicUsize::new(0);
+    if let Some(u) = used {
+        println!("--used-only: {} pipelines earlier runs used (used-pipelines.txt); compute programs of other pipelines are passed over", u.len());
+    }
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
     // no title runs: only a little commit is kept free besides the compiles
@@ -1584,19 +1373,22 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 let (name, blob) = input.get(i);
                 let Some(blob) = blob else { continue };
                 let Some(sh) = xbox::parse(&blob) else { continue };
-                if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) || !selected(select, &blob) {
+                if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
                     done.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
+                    if used.is_some_and(|u| !used_compute(&blob, u)) {
+                        unused.fetch_add(1, Ordering::Relaxed);
+                        done.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
-                            // made on the GPU once all are translated, in their order
-                            if pipelines.is_some() {
-                                let used = used.contains(&crate::hle::d3d12x::real::shaders_key(std::slice::from_ref(&blob)));
-                                jobs.lock().unwrap().push(PipelineJob { used, compiled: c });
+                            if let Some(p) = pipelines {
+                                p.make(&c);
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
@@ -1666,8 +1458,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         skipped.into_inner(),
         t0.elapsed().as_secs_f64()
     );
+    if used.is_some() {
+        println!("compute programs passed over (no earlier run used their pipeline): {}", unused.into_inner());
+    }
     if let Some(p) = pipelines {
-        make_pipelines(p, jobs.into_inner().unwrap(), used.len(), t0);
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
         let capped = p.capped.load(Ordering::Relaxed);
@@ -2008,6 +1802,21 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
 
 #[cfg(test)]
 mod tests {
+    /// `--used-only` keeps a compute program exactly when the runtime noted its pipeline: the
+    /// key of a pipeline of that one shader, as `real::shaders_key` makes it.
+    #[test]
+    fn used_only_keeps_the_compute_programs_an_earlier_run_used() {
+        let (a, b) = (vec![1u8, 2, 3, 4], vec![5u8, 6, 7, 8]);
+        let used: std::collections::HashSet<u64> = [crate::hle::d3d12x::real::shaders_key(&[a.clone()])].into_iter().collect();
+        assert!(super::used_compute(&a, &used));
+        assert!(!super::used_compute(&b, &used));
+        // the keys as the runtime writes them, one hexadecimal key a line
+        let text = format!("{:016x}
+", crate::hle::d3d12x::real::shaders_key(&[b.clone()]));
+        let keys: std::collections::HashSet<u64> = text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect();
+        assert!(super::used_compute(&b, &keys));
+    }
+
     use super::*;
     use crate::gpu::xbox::tests::{fssm, sample, CODE};
 

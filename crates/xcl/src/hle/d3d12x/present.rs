@@ -63,7 +63,6 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
 
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
-    super::pso_async::begin_frame();
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
         static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -154,43 +153,6 @@ unsafe fn add_ref(p: usize) {
 unsafe fn release(p: usize) {
     let f: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(*(*(p as *const *const usize)).add(2));
     f(p);
-}
-
-/// The CPU descriptor range of each descriptor heap (`note_heap_range`), so the RTV entries
-/// naming one go when the heap is released (`forget_heap`): each holds a reference to the
-/// resource it was made for, and a heap's entries used to stay for the life of the process.
-static HEAP_RANGES: Mutex<Option<HashMap<usize, (usize, usize)>>> = Mutex::new(None);
-
-/// `heap` covers the CPU descriptors `[base, base + size)`.
-pub fn note_heap_range(heap: usize, base: usize, size: usize) {
-    if base == 0 || size == 0 {
-        return;
-    }
-    HEAP_RANGES.lock().unwrap().get_or_insert_with(HashMap::new).insert(heap, (base, size));
-}
-
-/// The RTV entries whose handle is in `[base, base + size)` are dropped, and the resources they
-/// named returned for the caller to release.
-pub fn take_rtv_range(base: usize, size: usize) -> Vec<usize> {
-    if size == 0 {
-        return Vec::new();
-    }
-    let mut g = RTVS.lock().unwrap();
-    let Some(m) = g.as_mut() else { return Vec::new() };
-    let end = base.saturating_add(size);
-    let keys: Vec<usize> = m.keys().copied().filter(|h| *h >= base && *h < end).collect();
-    keys.into_iter().filter_map(|h| m.remove(&h)).collect()
-}
-
-/// Descriptor heap `heap` was released for good: the RTV entries made in its descriptors name
-/// handles no object can use again, and each keeps the resource alive.
-pub fn forget_heap(heap: usize) {
-    let Some((base, size)) = HEAP_RANGES.lock().unwrap().as_mut().and_then(|m| m.remove(&heap)) else { return };
-    for r in take_rtv_range(base, size) {
-        if r != 0 {
-            unsafe { release(r) };
-        }
-    }
 }
 
 pub unsafe fn note_rtv(handle: usize, res: *mut c_void) {
@@ -301,6 +263,7 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
             q.push(queue as usize);
         }
     }
+    super::late_release::drain_known(false);
     if !enabled() || IN_PRESENT.with(|c| c.get()) || PRESENTX.load(Ordering::Relaxed) {
         return;
     }
@@ -556,24 +519,108 @@ fn ensure_window() -> Option<HWND> {
 // presenter
 // ---------------------------------------------------------------------------------------
 
-struct WineQueue {
-    queue: ID3D12CommandQueue,
-    sync_fence: ID3D12Fence,
-    sync_value: u64,
+/// Number of in-flight present command allocators (`XCL_PRESENT_SYNC=1` drops to 1).
+const PRESENT_SLOTS: usize = 2;
+/// Swap chain buffer count (triple buffered so frame N copies into a free buffer while frame N-1
+/// finishes on the GPU and an earlier buffer scans out).
+const SWAP_BUFFERS: u32 = 3;
+
+/// Pipelined fence ring tracking which submitted present fence owns each command-allocator slot.
+/// With `slots == 2`, presenting frame `N` waits only for frame `N - 2` (overlapping CPU/GPU work
+/// across frames `N - 1` and `N`), while resize, queue switch, and `XCL_FRAME_DUMP` readbacks
+/// drain all slots cleanly.
+struct PresentRing {
+    slot_fences: Vec<u64>,
+    cur: usize,
+    recorded_value: u64,
+}
+
+impl PresentRing {
+    fn new(slots: usize) -> Self {
+        Self { slot_fences: vec![0; slots.max(1)], cur: 0, recorded_value: 0 }
+    }
+
+    /// Observe `presenter_value` (`Presenter.value`) before starting the next present.
+    /// If a new submission occurred since our last call (`presenter_value > recorded_value`),
+    /// attaches `presenter_value` to the previous slot, rotates to the next slot, and returns
+    /// `(slot_to_use, fence_to_wait, rotated_from_prev)`.
+    fn begin_present(&mut self, presenter_value: u64) -> (usize, u64, Option<usize>) {
+        if presenter_value > self.recorded_value {
+            let prev = self.cur;
+            self.slot_fences[prev] = presenter_value;
+            self.recorded_value = presenter_value;
+            let next = (prev + 1) % self.slot_fences.len();
+            self.cur = next;
+            let rotated = (next != prev).then_some(prev);
+            return (next, self.slot_fences[next], rotated);
+        }
+        (self.cur, self.slot_fences[self.cur], None)
+    }
+
+    fn mark_slot_reusable(&mut self, slot: usize) {
+        self.slot_fences[slot] = 0;
+    }
+
+    /// Mark all slots idle after draining up to `drained_value` (resize / queue switch / dump).
+    fn mark_all_drained(&mut self, drained_value: u64) {
+        self.slot_fences.fill(0);
+        if drained_value > self.recorded_value {
+            self.recorded_value = drained_value;
+        }
+    }
+}
+
+fn present_slot_count() -> usize {
+    if std::env::var("XCL_PRESENT_SYNC").is_ok_and(|v| v.trim() == "1") {
+        1
+    } else {
+        PRESENT_SLOTS
+    }
+}
+
+unsafe fn prepare_pipelined_slot(p: &mut Presenter, is_present_x: bool) -> Result<(), FenceError> {
+    let (slot, wait_val, rotated) = p.ring.begin_present(p.value);
+    if let Some(prev) = rotated {
+        p.slot_sources[prev] = p.copy_source.take();
+        // If frame N-1 had an XCL_FRAME_DUMP wait timeout, keep its readback buffers alive on
+        // slot `prev` until that slot's fence completes (preventing GPU UAF).
+        p.slot_dumps[prev] = std::mem::take(&mut p.dumps);
+        if let Some(spare) = p.spare_alloc.as_mut() {
+            std::mem::swap(&mut p.alloc, spare);
+        }
+    }
+    if wait_val > 0 {
+        let timeout_ms = if is_present_x { 2000 } else { 100 };
+        fence::wait(&p.fence, wait_val, &p.dev, Some(p.event), timeout_ms)?;
+        p.ring.mark_slot_reusable(slot);
+        p.slot_sources[slot] = None;
+        p.slot_dumps[slot].clear();
+    }
+    Ok(())
+}
+
+fn mark_pipe_drained(p: &mut Presenter) {
+    p.ring.mark_all_drained(p.value);
+    for s in &mut p.slot_sources {
+        *s = None;
+    }
+    for d in &mut p.slot_dumps {
+        d.clear();
+    }
 }
 
 struct Presenter {
     queue: usize,
-    /// Under Wine, a presenter-owned PC direct queue and sync fence so the DXGI swap chain and
-    /// present copy do not run on the title's adopted queue (which stays black under
-    /// vkd3d-proton). `None` on native Windows.
-    wine: Option<WineQueue>,
     dev: ID3D12Device,
     sc: Option<IDXGISwapChain3>,
     w: u32,
     h: u32,
     fmt: DXGI_FORMAT,
     alloc: ID3D12CommandAllocator,
+    spare_alloc: Option<ID3D12CommandAllocator>,
+    ring: PresentRing,
+    slot_sources: Vec<Option<ID3D12Resource>>,
+    slot_dumps: Vec<Vec<FrameDump>>,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
     copy_source: Option<ID3D12Resource>,
@@ -611,94 +658,45 @@ unsafe fn transition(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after:
     }
 }
 
-/// Create a PC-native (unadopted) direct command queue, bypassing XCL's vtable adoption when
-/// `dev_raw` is adopted.
-unsafe fn create_pc_queue(dev_raw: *mut c_void, dev: &ID3D12Device) -> Option<ID3D12CommandQueue> {
-    let desc = D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() };
-    if !super::real::is_adopted(dev_raw) {
-        return dev.CreateCommandQueue(&desc).ok();
-    }
-    type F = unsafe extern "system" fn(*mut c_void, *const D3D12_COMMAND_QUEUE_DESC, *const windows::core::GUID, *mut *mut c_void) -> windows::core::HRESULT;
-    let f: F = std::mem::transmute(super::real::orig_fn(dev_raw, 8));
-    let mut raw = std::ptr::null_mut();
-    if f(dev_raw, &desc, &ID3D12CommandQueue::IID, &mut raw).is_err() || raw.is_null() {
-        return None;
-    }
-    Some(ID3D12CommandQueue::from_raw(raw))
-}
-
-unsafe fn create_pc_allocator(dev_raw: *mut c_void, dev: &ID3D12Device) -> Option<ID3D12CommandAllocator> {
-    if !super::real::is_adopted(dev_raw) {
-        return dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok();
-    }
-    type F = unsafe extern "system" fn(*mut c_void, D3D12_COMMAND_LIST_TYPE, *const windows::core::GUID, *mut *mut c_void) -> windows::core::HRESULT;
-    let f: F = std::mem::transmute(super::real::orig_fn(dev_raw, 9));
-    let mut raw = std::ptr::null_mut();
-    if f(dev_raw, D3D12_COMMAND_LIST_TYPE_DIRECT, &ID3D12CommandAllocator::IID, &mut raw).is_err() || raw.is_null() {
-        return None;
-    }
-    Some(ID3D12CommandAllocator::from_raw(raw))
-}
-
-unsafe fn create_pc_list(dev_raw: *mut c_void, dev: &ID3D12Device, alloc: &ID3D12CommandAllocator) -> Option<ID3D12GraphicsCommandList> {
-    if !super::real::is_adopted(dev_raw) {
-        return dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, None).ok();
-    }
-    type F = unsafe extern "system" fn(*mut c_void, u32, D3D12_COMMAND_LIST_TYPE, *mut c_void, *mut c_void, *const windows::core::GUID, *mut *mut c_void) -> windows::core::HRESULT;
-    let f: F = std::mem::transmute(super::real::orig_fn(dev_raw, 12));
-    let mut raw = std::ptr::null_mut();
-    if f(dev_raw, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.as_raw(), std::ptr::null_mut(), &ID3D12GraphicsCommandList::IID, &mut raw).is_err() || raw.is_null() {
-        return None;
-    }
-    Some(ID3D12GraphicsCommandList::from_raw(raw))
-}
-
-unsafe fn create_pc_fence(dev_raw: *mut c_void, dev: &ID3D12Device) -> Option<ID3D12Fence> {
-    if !super::real::is_adopted(dev_raw) {
-        return dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok();
-    }
-    type F = unsafe extern "system" fn(*mut c_void, u64, D3D12_FENCE_FLAGS, *const windows::core::GUID, *mut *mut c_void) -> windows::core::HRESULT;
-    let f: F = std::mem::transmute(super::real::orig_fn(dev_raw, 36));
-    let mut raw = std::ptr::null_mut();
-    if f(dev_raw, 0, D3D12_FENCE_FLAG_NONE, &ID3D12Fence::IID, &mut raw).is_err() || raw.is_null() {
-        return None;
-    }
-    Some(ID3D12Fence::from_raw(raw))
-}
-
 unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let dev_raw = super::real::device_raw();
     let dev = ID3D12Device::from_raw_borrowed(&dev_raw)?;
-    let (wine, alloc, list, fence) = if crate::util::under_wine() {
-        let own_queue = create_pc_queue(dev_raw, dev)?;
-        let sync_fence = create_pc_fence(dev_raw, dev)?;
-        let alloc = create_pc_allocator(dev_raw, dev)?;
-        let list = create_pc_list(dev_raw, dev, &alloc)?;
-        list.Close().ok()?;
-        let fence = create_pc_fence(dev_raw, dev)?;
-        crate::xlog_info!("present: using a dedicated PC direct queue under Wine");
-        (Some(WineQueue { queue: own_queue, sync_fence, sync_value: 0 }), alloc, list, fence)
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+    let spare_alloc = if present_slot_count() > 1 {
+        dev.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()
     } else {
-        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
-        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
-        list.Close().ok()?;
-        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
-        (None, alloc, list, fence)
+        None
     };
+    let actual_slots = if spare_alloc.is_some() { 2 } else { 1 };
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
+    list.Close().ok()?;
+    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
-        queue, wine, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
+        queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN,
+        alloc, spare_alloc, ring: PresentRing::new(actual_slots),
+        slot_sources: vec![None; actual_slots], slot_dumps: (0..actual_slots).map(|_| Vec::new()).collect(),
+        list, fence,
         copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1),
     })
 }
 
 unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: DXGI_FORMAT) -> bool {
-    if let Some(sc) = &p.sc {
+    if let Some(sc) = p.sc.clone() {
         if p.w == w && p.h == h && p.fmt == fmt {
             return true;
         }
-        if sc.ResizeBuffers(2, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
+        // Drain every in-flight present before ResizeBuffers so no GPU copy references old buffers.
+        if p.value > 0 {
+            if let Err(e) = fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
+                p.disabled = matches!(&e, FenceError::Removed(_));
+                crate::xlog_error!("present: drain before resize: {e}");
+                return false;
+            }
+            mark_pipe_drained(p);
+        }
+        if sc.ResizeBuffers(SWAP_BUFFERS, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
             p.w = w;
             p.h = h;
             p.fmt = fmt;
@@ -708,7 +706,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
         return false;
     }
     let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return false };
-    let qraw = p.wine.as_ref().map_or(p.queue as *mut c_void, |w| w.queue.as_raw());
+    let qraw = p.queue as *mut c_void;
     let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return false };
     let desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: w,
@@ -716,7 +714,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
         Format: fmt,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        BufferCount: 2,
+        BufferCount: SWAP_BUFFERS,
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
         AlphaMode: DXGI_ALPHA_MODE_IGNORE,
@@ -788,8 +786,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.queue != queue {
         return; // swap chain is bound to the first queue we presented from
     }
-    // wait for the previous copy so the allocator can be reused
-    if let Err(e) = fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 100) {
+    // rotate to the oldest in-flight allocator slot and wait only for its fence (frame N-2)
+    if let Err(e) = prepare_pipelined_slot(p, frame.is_some()) {
         p.disabled = matches!(&e, FenceError::Removed(_));
         if !matches!(&e, FenceError::Timeout(_)) {
             crate::xlog_error!("present: previous copy: {e}");
@@ -845,46 +843,18 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         return;
     }
     let qraw = queue as *mut c_void;
-    let Some(title_q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
-    if let Some(wine) = p.wine.as_mut() {
-        wine.sync_value += 1;
-        if let Err(e) = title_q.Signal(&wine.sync_fence, wine.sync_value) {
-            let e = fence::api_error(&p.dev, "Signal", e);
-            p.disabled = matches!(&e, FenceError::Removed(_));
-            crate::xlog_error!("present: sync title queue: {e}");
-            return;
-        }
-        if let Err(e) = wine.queue.Wait(&wine.sync_fence, wine.sync_value) {
-            let e = fence::api_error(&p.dev, "Wait", e);
-            p.disabled = matches!(&e, FenceError::Removed(_));
-            crate::xlog_error!("present: wait title queue: {e}");
-            return;
-        }
-        wine.queue.ExecuteCommandLists(&[Some(cl)]);
-        p.copy_source = Some(src);
-        p.dumps = dumps;
-        p.value += 1;
-        if let Err(e) = wine.queue.Signal(&p.fence, p.value) {
-            // The copy is already submitted. Without its signal, keep its resources and allocator.
-            p.disabled = true;
-            let e = fence::api_error(&p.dev, "Signal", e);
-            crate::xlog_error!("present: submit copy: {e}");
-            return;
-        }
-        let _ = title_q.Wait(&p.fence, p.value);
-    } else {
-        title_q.ExecuteCommandLists(&[Some(cl)]);
-        p.copy_source = Some(src);
-        p.dumps = dumps;
-        p.value += 1;
-        if let Err(e) = title_q.Signal(&p.fence, p.value) {
-            // The copy is already submitted. Without its signal, keep its resources and allocator.
-            p.disabled = true;
-            let e = fence::api_error(&p.dev, "Signal", e);
-            crate::xlog_error!("present: submit copy: {e}");
-            return;
-        }
+    q.ExecuteCommandLists(&[Some(cl)]);
+    p.copy_source = Some(src);
+    p.dumps = dumps;
+    p.value += 1;
+    if let Err(e) = q.Signal(&p.fence, p.value) {
+        // The copy is already submitted. Without its signal, keep its resources and allocator.
+        p.disabled = true;
+        let e = fence::api_error(&p.dev, "Signal", e);
+        crate::xlog_error!("present: submit copy: {e}");
+        return;
     }
     if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
         let e = fence::api_error(&p.dev, "Present", e);
@@ -899,6 +869,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
                 for dump in p.dumps.drain(..) {
                     write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
                 }
+                mark_pipe_drained(p);
+                p.copy_source = None;
             }
             Err(e) => {
                 p.disabled = matches!(&e, FenceError::Removed(_));
@@ -1136,6 +1108,9 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
 impl Drop for Presenter {
     fn drop(&mut self) {
         unsafe {
+            if !self.disabled && self.value > 0 {
+                let _ = fence::wait(&self.fence, self.value, &self.dev, Some(self.event), 1000);
+            }
             let _ = CloseHandle(self.event);
         }
     }
@@ -1145,39 +1120,37 @@ impl Drop for Presenter {
 mod tests {
     use super::*;
 
-    /// Each RTV entry keeps its resource alive; entries made in a released descriptor heap's
-    /// descriptors name handles no object can use again, so they must go (and another heap's
-    /// stay).
     #[test]
-    fn a_released_descriptor_heaps_rtv_entries_go_with_it() {
-        let (heap, other) = (0x7E57_0001usize, 0x7E57_0002usize);
-        note_heap_range(heap, 0x1000, 0x100);
-        note_heap_range(other, 0x2000, 0x100);
-        note_heap_range(0x7E57_0003, 0, 0x100); // (no base: not recorded)
-        {
-            let mut g = RTVS.lock().unwrap();
-            let m = g.get_or_insert_with(HashMap::new);
-            m.insert(0x1000, 0); // (0: a resource already gone – nothing to release)
-            m.insert(0x10F0, 0);
-            m.insert(0x1100, 0); // past the heap's end
-            m.insert(0x2000, 0);
-        }
-        forget_heap(heap);
-        {
-            let g = RTVS.lock().unwrap();
-            let m = g.as_ref().unwrap();
-            assert!(!m.contains_key(&0x1000) && !m.contains_key(&0x10F0), "the heap's own entries go");
-            assert!(m.contains_key(&0x1100), "an entry past its end is another heap's");
-            assert!(m.contains_key(&0x2000), "another heap keeps its entries");
-            assert_eq!(HEAP_RANGES.lock().unwrap().as_ref().unwrap().len(), 1, "the range is forgotten (the other heap's is not)");
-        }
-        // a second release finds no range (and no entries): nothing happens
-        forget_heap(heap);
-        assert!(RTVS.lock().unwrap().as_ref().unwrap().contains_key(&0x1100));
-        // clean up for the other tests
-        forget_heap(other);
-        RTVS.lock().unwrap().as_mut().unwrap().clear();
-        HEAP_RANGES.lock().unwrap().as_mut().unwrap().clear();
+    fn present_ring_overlaps_previous_frame_and_drains_cleanly() {
+        let mut ring = PresentRing::new(PRESENT_SLOTS);
+        // Frame 1 (p.value == 0) -> slot 0, no wait, no rotation.
+        assert_eq!(ring.begin_present(0), (0, 0, None));
+
+        // Frame 2 (p.value == 1 after frame 1 submitted) -> rotates 0 -> 1, no wait (overlaps frame 1).
+        assert_eq!(ring.begin_present(1), (1, 0, Some(0)));
+
+        // Frame 3 (p.value == 2 after frame 2 submitted) -> rotates 1 -> 0, waits only for frame 1 (N-2).
+        assert_eq!(ring.begin_present(2), (0, 1, Some(1)));
+        // Retry on timeout (p.value still 2) stays on slot 0 without rotating again.
+        assert_eq!(ring.begin_present(2), (0, 1, None));
+        ring.mark_slot_reusable(0);
+        assert_eq!(ring.begin_present(2), (0, 0, None));
+
+        // Frame 4 (p.value == 3 after frame 3 submitted) -> rotates 0 -> 1, waits only for frame 2 (N-2).
+        assert_eq!(ring.begin_present(3), (1, 2, Some(0)));
+        ring.mark_slot_reusable(1);
+
+        // Drain after frame 4 submitted (e.g. XCL_FRAME_DUMP / ResizeBuffers) clears all slots.
+        ring.mark_all_drained(4);
+        assert_eq!(ring.begin_present(4), (1, 0, None));
+        assert_eq!(ring.begin_present(5), (0, 0, Some(1)));
+
+        // 1-slot sync mode waits on every previous frame N-1 without rotating.
+        let mut sync = PresentRing::new(1);
+        assert_eq!(sync.begin_present(0), (0, 0, None));
+        assert_eq!(sync.begin_present(1), (0, 1, None));
+        sync.mark_slot_reusable(0);
+        assert_eq!(sync.begin_present(2), (0, 2, None));
     }
 
     #[test]
@@ -1328,85 +1301,6 @@ mod frame_dump_tests {
             write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
             let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
-        }
-    }
-
-    #[test]
-    fn dedicated_pc_queue_copies_across_fence_from_title_queue() {
-        unsafe {
-            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
-                crate::gpu::recomp::runner::skip_test("no GPU");
-                return;
-            };
-            let dev_raw = dev.as_raw();
-            let title_q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
-            let title_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
-            let title_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &title_alloc, None).unwrap();
-
-            let own_q = create_pc_queue(dev_raw, &dev).unwrap();
-            let sync_fence = create_pc_fence(dev_raw, &dev).unwrap();
-            let present_alloc = create_pc_allocator(dev_raw, &dev).unwrap();
-            let present_list = create_pc_list(dev_raw, &dev, &present_alloc).unwrap();
-            let present_fence = create_pc_fence(dev_raw, &dev).unwrap();
-            let event = CreateEventW(None, false, false, None).unwrap();
-
-            let tex_desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                Width: 8,
-                Height: 8,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
-                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                ..Default::default()
-            };
-            let mut rt: Option<ID3D12Resource> = None;
-            dev.CreateCommittedResource(
-                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
-                D3D12_HEAP_FLAG_NONE,
-                &tex_desc,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                None,
-                &mut rt,
-            )
-            .unwrap();
-            let rt = rt.unwrap();
-
-            let rtv_heap: ID3D12DescriptorHeap = dev
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                    NumDescriptors: 1,
-                    ..Default::default()
-                })
-                .unwrap();
-            let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
-            dev.CreateRenderTargetView(&rt, None, rtv);
-
-            // Title queue clears RT to green and transitions to COMMON/PRESENT.
-            title_list.ClearRenderTargetView(rtv, &[0.0, 1.0, 0.0, 1.0], None);
-            title_list.ResourceBarrier(&[transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
-            title_list.Close().unwrap();
-            title_q.ExecuteCommandLists(&[Some(title_list.cast().unwrap())]);
-            title_q.Signal(&sync_fence, 1).unwrap();
-
-            // Dedicated presenter queue waits on sync_fence, copies RT into a readback buffer, and signals present_fence.
-            let (rb, fp) = readback_copy(&present_list, &rt, &tex_desc).unwrap();
-            present_list.Close().unwrap();
-            own_q.Wait(&sync_fence, 1).unwrap();
-            own_q.ExecuteCommandLists(&[Some(present_list.cast().unwrap())]);
-            own_q.Signal(&present_fence, 1).unwrap();
-            title_q.Wait(&present_fence, 1).unwrap();
-
-            fence::wait(&present_fence, 1, &dev, Some(event), 5000).unwrap();
-            let _ = CloseHandle(event);
-
-            let mut p: *mut c_void = std::ptr::null_mut();
-            rb.Map(0, None, Some(&mut p)).unwrap();
-            let px = ((p as *const u8).add(fp.Offset as usize) as *const u32).read_unaligned();
-            rb.Unmap(0, None);
-            assert_eq!(px, 0xFF00_FF00, "expected green texel copied across dedicated presenter queue");
         }
     }
 }

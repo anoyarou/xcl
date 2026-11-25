@@ -236,8 +236,6 @@ fn scalar_bfe_64_handles_unsigned_signed_and_zero_width() {
 fn scalar_bitcmp_64_selects_the_indexed_half() {
     let code = prog(&[
         ("S_BITCMP1_B64", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 8)], None),
-        // Consume the first scc before the second bitcmp overwrites it so dead-scc elision keeps both.
-        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 129), ("SSRC1", 128)], None),
         ("S_BITCMP0_B64", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 9)], None),
     ]);
     let t = translate(&code, &Options::default()).unwrap();
@@ -411,11 +409,11 @@ fn atomic_inc_dec_x2_encoding_families() {
     }
 }
 
-/// *_atomic_fcmpswap_x2 (buffer / flat / global): a 64-bit float compare-swap; the payload
-/// compares bitwise, exactly like the 32-bit fcmpswap – one InterlockedCompareExchange64.
-/// Deterministic emitted text on all three encoding families.
+/// *_atomic_fcmpswap_x2 (buffer / flat / global): 64-bit IEEE-754 float compare-swap in a
+/// bounded u64 CAS loop (`-0.0 == +0.0`, `NaN != NaN`, no `DoubleExtensions` required).
+/// Deterministic emitted text on all three encoding families, plus multi-window & direct DXIL.
 #[test]
-fn atomic_fcmpswap_x2_is_a_bitwise_64_bit_cas() {
+fn atomic_fcmpswap_x2_uses_ieee_64_bit_cas() {
     let code = prog(&[
         ("BUFFER_ATOMIC_FCMPSWAP_X2", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 8), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1), ("GLC", 1)], None),
         ("FLAT_ATOMIC_FCMPSWAP_X2", "ENC_FLAT", &[("VDST", 12), ("ADDR", 14), ("DATA", 16), ("GLC", 1)], None),
@@ -423,8 +421,13 @@ fn atomic_fcmpswap_x2_is_a_bitwise_64_bit_cas() {
     ]);
     let t = translate(&code, &Options::default()).unwrap();
     assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
-    // one native 64-bit CAS per instruction – no emulation loop
+    // bounded IEEE-754 float CAS loop using atomic Or-0 initial load, pure u64 bitwise checks,
+    // and InterlockedCompareExchange64 (no tearing 64-bit Load2 on mismatch early-exit)
+    assert!(!t.hlsl.contains("mem.Load2("), "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("mem.InterlockedOr64(").count(), 3, "{}", t.hlsl);
     assert_eq!(t.hlsl.matches("mem.InterlockedCompareExchange64(").count(), 3, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("0x7FF0000000000000ull").count(), 3, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("0x7FFFFFFFFFFFFFFFull").count(), 6, "{}", t.hlsl);
     // [DATA:DATA+1] is the swap value, [DATA+2:DATA+3] the compare value (128-bit operand)
     assert!(t.hlsl.contains("_v = (uint64_t)v4 | ((uint64_t)v5 << 32); uint64_t") && t.hlsl.contains("_cmp = (uint64_t)v6 | ((uint64_t)v7 << 32);"), "{}", t.hlsl);
     assert!(t.hlsl.contains("_cmp = (uint64_t)v18 | ((uint64_t)v19 << 32);"), "{}", t.hlsl);
@@ -438,8 +441,17 @@ fn atomic_fcmpswap_x2_is_a_bitwise_64_bit_cas() {
     assert!(t.hlsl.contains("v4 = (uint)t") && t.hlsl.contains("v5 = (uint)(t"), "{}", t.hlsl);
     assert!(t.hlsl.contains("v12 = (uint)t") && t.hlsl.contains("v13 = (uint)(t"), "{}", t.hlsl);
     assert!(t.hlsl.contains("v20 = (uint)t") && t.hlsl.contains("v21 = (uint)(t"), "{}", t.hlsl);
+    let w = translate(&code, &Options { mem_windows: 2, ..Default::default() }).unwrap();
+    assert!(!w.hlsl.contains("xcl_mLoad2(t"), "{}", w.hlsl);
+    assert_eq!(w.hlsl.matches("xcl_mInterlockedOr64(t").count(), 3, "{}", w.hlsl);
+    assert_eq!(w.hlsl.matches("xcl_mInterlockedCompareExchange64(t").count(), 3, "{}", w.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        super::dxc::compile(&w.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", w.hlsl));
+        for mem_windows in [1, 2, 2 | super::HEAP_WINDOWS] {
+            let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: true, mem_windows, sampler_base: 0 };
+            crate::gpu::dxil::kernel::translate_full(&code, o).unwrap_or_else(|e| panic!("dxil windows={mem_windows:#x}: {e}"));
+        }
     }
 }
 
@@ -494,7 +506,7 @@ fn unary_f64_math_vop1_and_vop3() {
     assert_eq!(t.hlsl.matches("fract_d(").count(), 3, "{}", t.hlsl); // helper plus two calls
     // f64 roots through sqrt_d (HLSL's sqrt is f32): V_SQRT / V_RSQ, twice each
     assert_eq!(t.hlsl.matches("sqrt_d(").count(), 1 + 4, "{}", t.hlsl); // helper plus four calls
-    assert_eq!(t.hlsl.matches("(double)1 / sqrt_d(").count(), 2, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("rcp_d(sqrt_d(").count(), 2, "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
         direct_check(&code, &Options::default());
@@ -594,6 +606,16 @@ fn cvt_norm_f16_instructions() {
     assert!(t.hlsl.contains("(cvt_norm_i16_f16((v9 >> 16)) | (cvt_norm_i16_f16((v10 >> 16)) << 16))"), "{}", t.hlsl);
     // inline float constants decode as f16 bit patterns (1.0 = 0x3C00, −1.0 = 0xBC00)
     assert!(t.hlsl.contains("cvt_norm_u16_f16((0x00003C00u & 0xFFFFu))") && t.hlsl.contains("cvt_norm_u16_f16((0x0000BC00u & 0xFFFFu))"), "{}", t.hlsl);
+}
+
+/// `v_div_fixup_f16` (VOP3, three f16 sources: quotient, denominator, numerator) is translated
+/// like `v_div_fixup_f32`, on half-precision operands, instead of being left as unsupported.
+#[test]
+fn div_fixup_f16_instruction() {
+    let code = prog(&[("V_DIV_FIXUP_F16", "ENC_VOP3", &[("VDST", 1), ("SRC0", V + 9), ("SRC1", V + 10), ("SRC2", V + 11)], None)]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    assert!(t.hlsl.contains("div_fixup(f16tof32(((v9) & 0xFFFFu)), f16tof32(((v10) & 0xFFFFu)), f16tof32(((v11) & 0xFFFFu)))"), "{}", t.hlsl);
 }
 
 /// GPU verification of exact RNE rounding and edge cases for `V_CVT_NORM_*_F16` and
@@ -740,6 +762,119 @@ fn gpu_rndne_f64() {
         let got = regs[2] as u64 | ((regs[3] as u64) << 32);
         let want = if x.is_nan() { x.to_bits() } else { x.round_ties_even().to_bits() };
         assert_eq!(got, want, "lane {lane}: {x:?}");
+    }
+}
+
+#[test]
+fn gpu_frexp_exp_f32_denorm_modes() {
+    const CASES: [(u32, i32, i32); 13] = [
+        (0x0000_0001, -148, 0), (0x0000_0003, -147, 0), (0x007F_FFFF, -126, 0),
+        (0x0080_0000, -125, -125), (0x8000_0001, -148, 0), (0x0000_0000, 0, 0),
+        (0x8000_0000, 0, 0), (0x4060_0000, 2, 2), (0xC060_0000, 2, 2),
+        (0x7F7F_FFFF, 128, 128), (0x7F80_0000, 0, 0), (0xFF80_0000, 0, 0),
+        (0x7FC0_0000, 0, 0),
+    ];
+    let p = prog(&[
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 12)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 13)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V)], None),
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 14)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 6), ("SRC0", V)], None),
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 15)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 7), ("SRC0", V)], None),
+    ]);
+    let mut st = KernelState::default();
+    for (lane, v) in st.vgpr.iter_mut().enumerate() {
+        v[0] = CASES[lane % CASES.len()].0;
+        v[4..8].fill(u32::MAX);
+    }
+    for wave64 in gpu_waves() {
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (lane, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (bits, preserve, flush) = CASES[lane % CASES.len()];
+            let got = [v[4] as i32, v[5] as i32, v[6] as i32, v[7] as i32];
+            assert_eq!(got, [flush, preserve, flush, preserve], "wave{lanes} lane {lane}: {bits:#010x}");
+        }
+    }
+}
+
+#[test]
+fn gpu_frexp_exp_f32_denorm_setreg() {
+    let p = prog(&[
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 12)], None),
+        ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 2, 3))], Some(4)),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+        ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 5, 1))], Some(0)),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V)], None),
+        ("S_SETREG_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 4, 2)), ("SDST", 0)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 6), ("SRC0", V)], None),
+        ("S_SETREG_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 4, 2)), ("SDST", 1)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 7), ("SRC0", V)], None),
+    ]);
+    let mut st = KernelState::default();
+    st.sgpr[0] = 2;
+    st.sgpr[1] = 1;
+    for v in &mut st.vgpr {
+        v[0] = 1;
+        v[4..8].fill(u32::MAX);
+    }
+    for wave64 in gpu_waves() {
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (lane, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let got = [v[4] as i32, v[5] as i32, v[6] as i32, v[7] as i32];
+            assert_eq!(got, [-148, -148, 0, -148], "wave{lanes} lane {lane}");
+        }
+    }
+}
+
+#[test]
+fn gpu_frexp_exp_f32_denorm_control_flow() {
+    let p = prog(&[
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 13)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 12)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+    ]);
+    let mut st = KernelState::default();
+    for v in &mut st.vgpr {
+        v[0] = 1;
+        v[4] = u32::MAX;
+    }
+    for wave64 in gpu_waves() {
+        for (s0, expected) in [(1, 0), (0, -148)] {
+            st.sgpr[0] = s0;
+            let (r, lanes) = run_wave(&p, &st, wave64);
+            for (lane, v) in r.vgpr.iter().take(lanes).enumerate() {
+                assert_eq!(v[4] as i32, expected, "wave{lanes} lane {lane}: s0={s0}");
+            }
+        }
+    }
+}
+
+#[test]
+fn gpu_frexp_exp_f32_denorm_initial_mode() {
+    let legacy = prog(&[("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None)]);
+    let conditional = prog(&[
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 13)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+    ]);
+    let mut st = KernelState::default();
+    let inputs = [0x0000_0001, 0x8000_0003, 0x007F_FFFF, 0x0080_0000, 0x8000_0000, 0x7FC0_0000];
+    for (lane, v) in st.vgpr.iter_mut().enumerate() {
+        v[0] = inputs[lane % inputs.len()];
+        v[4] = u32::MAX;
+    }
+    for wave64 in gpu_waves() {
+        let (expected, lanes) = run_wave(&legacy, &st, wave64);
+        let (actual, _) = run_wave(&conditional, &st, wave64);
+        for lane in 0..lanes {
+            assert_ne!(expected.vgpr[lane][4], u32::MAX, "wave{lanes} lane {lane}: unwritten reference");
+            assert_eq!(actual.vgpr[lane][4], expected.vgpr[lane][4], "wave{lanes} lane {lane}: initial MODE");
+        }
     }
 }
 
@@ -912,6 +1047,7 @@ fn f64_roots(wave64: bool) {
     let p = prog(&[
         ("V_SQRT_F64", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None),
         ("V_RSQ_F64", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+        ("V_RCP_F64", "ENC_VOP1", &[("VDST", 6), ("SRC0", V)], None),
     ]);
     let mut st = KernelState::default();
     f64_lanes(&mut st, &F64_EDGES);
@@ -928,7 +1064,8 @@ fn f64_roots(wave64: bool) {
     let mut bad = Vec::new();
     for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
         let x = f64::from_bits(F64_EDGES[l % F64_EDGES.len()]);
-        for (name, got, want, tol) in [("sqrt", pair(v, 2), x.sqrt(), 1), ("rsq", pair(v, 4), 1.0 / x.sqrt(), 2)] {
+        let checks = [("sqrt", pair(v, 2), x.sqrt(), 1), ("rsq", pair(v, 4), 1.0 / x.sqrt(), 2), ("rcp", pair(v, 6), 1.0 / x, 1)];
+        for (name, got, want, tol) in checks {
             if ulps(got, want) > tol {
                 bad.push(format!("v_{name}_f64({x:e}) = {got:e}, want {want:e}"));
             }
@@ -1695,6 +1832,142 @@ fn gpu_graphics_vs_ps_draw() {
     }
 }
 
+/// Build the four pixel-shader `EXP` `VM` test cases for XCL-BT-012 (#1488):
+/// (name, code, uses_vm_semantics). Each shades `x >= 8` as `(0.4, 0.6, 0.4, 1.0)` and
+/// discards `x < 8`.
+fn ps_exp_vm_cases() -> [(&'static str, Vec<u8>, bool); 4] {
+    let setup = [
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)][..], None), // save entry EXEC
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 255)], Some(0.4f32.to_bits())),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 255)], Some(0.6f32.to_bits())),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 255)], Some(0.4f32.to_bits())),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 242)], None),
+    ];
+    let narrow = ("V_CMPX_LT_F32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 2)][..], Some(8.0f32.to_bits()));
+    let restore = ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)][..], None);
+    let build = |tail: &[(&str, &str, &[(&str, u64)], Option<u32>)]| {
+        let mut all = setup.to_vec();
+        all.extend_from_slice(tail);
+        prog(&all)
+    };
+    [
+        // A: VM=1 DONE=0 under narrowed EXEC, then restored EXEC + VM=0 DONE=1 must not revive x < 8.
+        ("vm1_done0_then_vm0_done1", build(&[
+            narrow,
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("VM", 1)], None),
+            restore,
+            ("EXP", "ENC_EXP", &[("TGT", 9), ("EN", 0), ("DONE", 1)], None),
+        ]), true),
+        // B: Two VM=1 exports, second narrower — must overwrite (not OR) the earlier VM=1 mask.
+        ("two_vm1_second_narrower_overwrites", build(&[
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("VM", 1)], None),
+            narrow,
+            ("EXP", "ENC_EXP", &[("TGT", 9), ("EN", 0), ("VM", 1)], None),
+            restore,
+            ("EXP", "ENC_EXP", &[("TGT", 9), ("EN", 0), ("DONE", 1)], None),
+        ]), true),
+        // C: Undeclared MRT1 export with VM=1 DONE=0 followed by restored EXEC + MRT0 VM=0 DONE=1.
+        ("undeclared_mrt_vm1_done0_then_mrt0_vm0_done1", build(&[
+            narrow,
+            ("EXP", "ENC_EXP", &[("TGT", 1), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("VM", 1)], None),
+            restore,
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1)], None),
+        ]), true),
+        // D: Legacy synthetic shader with zero VM=1 exports falls back to DONE=1.
+        ("no_vm_falls_back_to_done1", build(&[
+            narrow,
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1)], None),
+        ]), false),
+    ]
+}
+
+/// CPU check for XCL-BT-012 (#1488): pixel-shader `EXP` `VM` codegen in HLSL (`emit.rs`)
+/// and container validation in Direct DXIL (`dxil/lower_gfx.rs`).
+#[test]
+fn ps_exp_vm_hlsl_and_direct_dxil_codegen() {
+    use super::PsInterface;
+    use crate::gpu::dxil::kernel::{translate_pixel, KernelOptions};
+    let psi = PsInterface {
+        inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)],
+        outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
+        input_ena: 0x302,
+        attrs: None,
+    };
+    let po = Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() };
+    for (name, ps_code, has_vm) in ps_exp_vm_cases() {
+        let pt = translate(&ps_code, &po).unwrap();
+        assert!(pt.complete(), "{name}: {:?}", pt.unsupported);
+        assert!(pt.hlsl.contains("if (!xcl_live) discard;"), "{name}: missing discard:\n{}", pt.hlsl);
+        if has_vm {
+            assert!(pt.hlsl.contains("xcl_live = ("), "{name}: VM=1 must overwrite xcl_live:\n{}", pt.hlsl);
+            assert!(!pt.hlsl.contains("xcl_live = true;"), "{name}: VM=0 DONE=1 must not OR-set xcl_live:\n{}", pt.hlsl);
+        } else {
+            assert!(pt.hlsl.contains("xcl_live = true;"), "{name}: no-VM fallback must keep DONE=1:\n{}", pt.hlsl);
+        }
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{name} DXC: {e}\n{}", pt.hlsl));
+            let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+            let dxil = translate_pixel(&ps_code, ko, &psi).unwrap_or_else(|e| panic!("{name} direct DXIL: {e}")).dxil;
+            crate::gpu::dxil::validate::validate(&dxil).unwrap_or_else(|e| panic!("{name} DXIL validate: {e}"));
+        }
+    }
+}
+
+/// GPU draw regression for XCL-BT-012 (#1488): verifies all four `EXP` `VM` pixel-survival
+/// cases on the GPU through both the HLSL and Direct DXIL pixel-shader backends.
+#[test]
+fn gpu_ps_exp_vm_controls_pixel_survival() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{PsInterface, VsInterface};
+    use crate::gpu::dxil::kernel::{translate_pixel, translate_vertex, KernelOptions};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+    let vs_code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+    ]);
+    let vsi = VsInterface {
+        inputs: vec![el("POSITION", 0, 0, 3, 0, 3)],
+        outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)],
+        attr_base: 4,
+        params: None,
+    };
+    let psi = PsInterface {
+        inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)],
+        outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
+        input_ena: 0x302,
+        attrs: None,
+    };
+    let vo = Options { mode: Mode::Vertex(vsi.clone()), wave64: true, ..Default::default() };
+    let po = Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() };
+    let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let vs_hlsl = super::dxc::compile(&translate(&vs_code, &vo).unwrap().hlsl, "main", "vs_6_6", &[]).unwrap();
+    let vs_dxil = translate_vertex(&vs_code, ko, &vsi).unwrap().dxil;
+    let verts = [-1.0f32, -1.0, -1.0, 3.0, 3.0, -1.0];
+    let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+    let clear = [0.0, 0.0, 1.0, 1.0];
+    let shaded = [0.4, 0.6, 0.4, 1.0];
+
+    for (name, ps_code, _) in ps_exp_vm_cases() {
+        let ps_hlsl = super::dxc::compile(&translate(&ps_code, &po).unwrap().hlsl, "main", "ps_6_6", &[]).unwrap();
+        let ps_dxil = translate_pixel(&ps_code, ko, &psi).unwrap().dxil;
+        for (backend, vs, ps) in [("hlsl", &vs_hlsl, &ps_hlsl), ("direct_dxil", &vs_dxil, &ps_dxil)] {
+            let px = runner::draw(vs, ps, &layout, &verts, 8, &[], &[], 16, clear).unwrap();
+            for y in 0..16 {
+                for x in 0..16 {
+                    let want = if x >= 8 { shaded } else { clear };
+                    let got = px[y * 16 + x];
+                    assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5), "{name} ({backend}) pixel ({x},{y}) = {got:?}, expected {want:?}");
+                }
+            }
+        }
+    }
+}
+
 /// `emit::rect_list_gs` declares the VS's output struct; the fourth vertex is v[0] with its
 /// float outputs continued from the other three, its integer (flat) ones left as v[0]'s.
 #[test]
@@ -2059,6 +2332,18 @@ fn draw_console_views(
 /// u = v = pixel centre · 2^0.25 / 8 gives LOD 0.25; offset (+1, 0).
 #[test]
 fn gpu_ps_image_sample_offset_implicit_lod_between_mips() {
+    // S#: clamp u / v / w, point min / mag, MIP_FILTER linear (2), LOD 0..15.99, sampler 0
+    implicit_lod_between_mips([2 | 2 << 3 | 2 << 6, 0xFFF << 12, 2 << 26, 0]);
+}
+
+/// The same with an aniso point (2) min / mag filter and a 4× anisotropy ratio: a nearest filter
+/// with anisotropy on (what a driver writes for one), so the texels are the point filter's.
+#[test]
+fn gpu_ps_image_sample_with_an_aniso_point_filter_samples_points() {
+    implicit_lod_between_mips([2 | 2 << 3 | 2 << 6 | 2 << 9, 0xFFF << 12, 2 << 20 | 2 << 22 | 2 << 26, 0]);
+}
+
+fn implicit_lod_between_mips(s_sharp: [u32; 4]) {
     if !gpu_ready() {
         return;
     }
@@ -2099,8 +2384,6 @@ fn gpu_ps_image_sample_offset_implicit_lod_between_mips() {
     };
     srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 4, ..Default::default() };
     let tex = runner::ViewTexture { res, srv, data, row_bytes: 8 * 16 };
-    // S#: clamp u / v / w, point min / mag, MIP_FILTER linear (2), LOD 0..15.99, sampler 0
-    let s_sharp = [2 | 2 << 3 | 2 << 6, 0xFFF << 12, 2 << 26, 0];
     let mut sgprs = vec![0u32; 32];
     sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
     sgprs[24..28].copy_from_slice(&s_sharp);
@@ -2633,7 +2916,7 @@ fn gpu_images_sample_load_store_atomic() {
         assert_eq!([fl(20), fl(21), fl(22), fl(23)], [1.5, 0.0, 1.5, 1.0], "lane {l} sample_l linear");
         assert_eq!([fl(40), fl(41), fl(42), fl(43)], [1.0, 2.0, 2.0, 1.0], "lane {l} gather4 red");
         assert_eq!([fl(14), fl(15)], [x, x + 4.0 * y], "lane {l} image_load dmask x,z");
-        assert_eq!(&v[50..54], &[4, 4, 1, 1], "lane {l} get_resinfo");
+        assert_eq!(&v[50..54], &[4, 4, 0, 1], "lane {l} get_resinfo (depth 0: a DIM without layers, as RDNA2)");
     }
     let t1: Vec<u32> = r.textures[0].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
     for i in 0..16 {
@@ -2641,6 +2924,62 @@ fn gpu_images_sample_load_store_atomic() {
     }
     assert_eq!(u32::from_le_bytes(r.textures[1][..4].try_into().unwrap()), 63, "image_atomic_umax");
     assert_eq!(u32::from_le_bytes(r.textures[2][..4].try_into().unwrap()), 64, "image_atomic_inc (64 lanes, limit 100)");
+}
+
+/// An image_load of a T# the program also stores through reads through the UAV when the
+/// invocation stored through that T# before (`xcl_iw16`); a program without image stores
+/// keeps the SRV-only load.
+#[test]
+fn image_load_of_a_stored_image_reads_through_the_uav() {
+    let store = ("IMAGE_STORE", "ENC_MIMG", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)][..], None);
+    let load = ("IMAGE_LOAD", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)][..], None);
+    let t = translate(&prog(&[store, load]), &Options::default()).unwrap();
+    assert!(t.hlsl.contains("static uint xcl_iw16 = 0u;") && t.hlsl.contains("xcl_iw16 = s16 + 1u;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("_rw = xcl_iw16 == s16 + 1u;") && t.hlsl.matches("RWTexture2D<uint4>").count() == 2, "{}", t.hlsl);
+    let t = translate(&prog(&[load]), &Options::default()).unwrap();
+    assert!(!t.hlsl.contains("xcl_iw") && !t.hlsl.contains("RWTexture2D"), "{}", t.hlsl);
+}
+
+/// An image the program stores to and then loads in the same dispatch (in-place accumulation,
+/// in-place blur, TAA history): RDNA2 reads its own write – the same lane right after the
+/// store, a neighbour after the barrier. Each lane stores 1000 + lane to its texel of an 8x8
+/// R32_UINT image, loads that texel back, and after `s_barrier` loads the texel of lane ^ 1.
+#[test]
+fn gpu_image_load_reads_a_store_of_the_same_dispatch() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = Vec::new();
+    // T# in s[16:23] (SRSRC = 4): own texel (v0, v1), neighbour's texel (v3, v4)
+    code.extend(mimg("IMAGE_STORE", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(encode("S_BARRIER", "ENC_SOPP", &[], None).unwrap());
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 11), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 20, 9));
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let n = l ^ 1;
+        r[0] = (l % 8) as u32;
+        r[1] = (l / 8) as u32;
+        r[2] = 1000 + l as u32;
+        r[3] = (n % 8) as u32;
+        r[4] = (n / 8) as u32;
+    }
+    let tex = [TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 8, height: 8, depth: 1, texel_bytes: 4, data: vec![0xEE; 8 * 8 * 4], uav: true }];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    let t: Vec<u32> = r.textures[0].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    for l in 0..64 {
+        assert_eq!(t[l], 1000 + l as u32, "image_store texel {l}");
+    }
+    let bad: Vec<String> = (0..64)
+        .filter(|&l| r.vgpr[l][10] != 1000 + l as u32 || r.vgpr[l][11] != 1000 + (l ^ 1) as u32)
+        .map(|l| format!("lane {l}: own {:#x}, neighbour {:#x}", r.vgpr[l][10], r.vgpr[l][11]))
+        .collect();
+    assert!(bad.is_empty(), "image_load after image_store of the same dispatch (want 1000 + lane, 1000 + (lane ^ 1)):\n{}", bad.join("\n"));
 }
 
 /// Static samplers: the program builds two S# from constants (point / linear, clamp) – as
@@ -3150,6 +3489,36 @@ fn gpu_mesh_mode_two_passes() {
     assert!(px16 == px, "split pass-through draws the same pixels");
 }
 
+#[test]
+fn mesh_passthrough_strips_rdna2_edge_flag_bits() {
+    use super::{mesh_passthrough, MsInterface};
+    let sig = |name: &str, sv: u32, reg: u32, idx: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: idx,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let ms = MsInterface {
+        outputs: vec![sig("SV_Position", 1, 0, 0), sig("TEXCOORD", 0, 1, 0)],
+        threads: 128,
+        max_vertices: 128,
+        max_primitives: 128,
+    };
+    let unsplit = mesh_passthrough(&ms);
+    assert!(unsplit.contains("uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu)"), "{unsplit}");
+    assert!(!unsplit.contains("0x3FFu"), "{unsplit}");
+
+    let ins: Vec<_> = (0..16).map(|k| sig("TEXCOORD", 0, k + 1, k)).collect();
+    assert!(super::emit::passthrough_split(&ms, super::emit::passthrough_elements(&ms, Some(&ins))) > 1);
+    let split = super::emit::mesh_passthrough_for(&ms, Some(&ins));
+    assert!(split.contains("uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu)"), "{split}");
+    assert!(!split.contains("0x3FFu"), "{split}");
+}
+
 /// The mesh output budget with wide vertices: DXC accounts whole chunks of 32 vertices even
 /// when fewer are declared, so 78 vertices with 22 float4 rows are accounted as 96 (33792 B >
 /// 32768) and the record must go out in split groups. A retail title's NGG transform programs
@@ -3579,11 +3948,7 @@ fn memory_windows_above_4_gib(heap: bool) {
     let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
     assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
-    // heap windows: a window outside the program's two selects the null view after all
-    // MAX_WINDOWS descriptors (not descriptor 2, a live window's view), with no branch
-    let select = format!("ResourceDescriptorHeap[NonUniformResourceIndex(xcl_w < 2u ? 0u + xcl_w : {}u)]", super::MEM_HEAP_NULL);
-    assert_eq!(t.hlsl.contains(&select), heap);
-    assert!(!t.hlsl.contains("if (xcl_w >="), "heap windows: no branch around an access");
+    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(4u + xcl_w)]"), heap);
     let hlsl_dxil = || super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
     let dxil = direct_or(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() }), hlsl_dxil());
     let hi = |a: u64| (a >> 32) as u32;
@@ -3626,6 +3991,17 @@ fn memory_windows_above_4_gib(heap: bool) {
 ///   on `global_load`/`global_store` updates the target window accurately.
 #[test]
 fn gpu_memory_windows_reject_out_of_uma_aliasing() {
+    memory_windows_reject_out_of_uma_aliasing(false);
+}
+
+/// The same with the windows taken from the descriptor heap (`Options::heap_windows`): an
+/// address outside them reads 0 and drops its stores and atomics there too.
+#[test]
+fn gpu_heap_windows_reject_out_of_uma_aliasing() {
+    memory_windows_reject_out_of_uma_aliasing(true);
+}
+
+fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     if !gpu_ready() {
         return;
     }
@@ -3738,7 +4114,7 @@ fn gpu_uma_import_check_at_init() {
     if !gpu_ready() {
         return;
     }
-    crate::hle::d3d12x::real::init().expect("real D3D12.X backend");
+    assert_eq!(crate::hle::d3d12x::backend(), crate::hle::d3d12x::Backend::Real, "real D3D12.X backend");
     let s = crate::hle::d3d12x::real::stats().uma_import_check;
     assert!(s.starts_with("ok") || s.starts_with("off"), "{s}");
 }
@@ -3760,7 +4136,7 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
     if !gpu_ready() {
         return;
     }
-    crate::hle::d3d12x::real::init().expect("real D3D12.X backend");
+    assert_eq!(crate::hle::d3d12x::backend(), crate::hle::d3d12x::Backend::Real, "real D3D12.X backend");
     let u = crate::gpu::uma::get().expect("UMA");
     assert_eq!(u.shader_windows(), 4, "runtime layout has 4 shader windows");
     assert!(u.is_sparse_window(0) && u.is_sparse_window(1) && u.is_sparse_window(2), "windows 0..2 sparse VRAM");
@@ -3806,10 +4182,10 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
 
     // Translate + DXC-compile RDNA2 compute shader (4 windows, 32-bit descriptor table with hi = 0)
     let p = prog(&[
-        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 0)], None), // s[0:1] -> Window 3 root arg table
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)], None), // s[0:1] -> Window 3 root arg table
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)], None), // s5 = 0 (32-bit descriptor table pointer)
-        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0)], None), // s[4:5] + 0 -> Window 0 sparse desc slot 0
-        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 32)], None), // s[4:5] + 32 -> Window 0 sparse desc slot 1
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)], None), // s[4:5] + 0 -> Window 0 sparse desc slot 0
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 32), ("SOFFSET", 125)], None), // s[4:5] + 32 -> Window 0 sparse desc slot 1
         ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None),
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 20), ("VSRC1", 1)], None),
         ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
@@ -3835,6 +4211,11 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, Some(&pso)).unwrap();
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        // The ABI root signature indexes both heaps directly, so they must be bound before it.
+        let heap = |ty| -> ID3D12DescriptorHeap {
+            dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: ty, NumDescriptors: 1, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 }).unwrap()
+        };
+        let heaps = [Some(heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)), Some(heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER))];
 
         // User SGPRs: s[0:1] = 64-bit arg_table (Window 3), s4 = 32-bit descriptor table offset in Window 0
         let mut io = vec![0u32; crate::gpu::recomp::KERNEL_SGPRS];
@@ -3850,6 +4231,7 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
                 alloc.Reset().unwrap();
                 list.Reset(&alloc, Some(&pso)).unwrap();
             }
+            list.SetDescriptorHeaps(&heaps);
             list.SetComputeRootSignature(&rs);
             list.SetComputeRootUnorderedAccessView(0, crate::hle::d3d12x::real::uma_va_of(io_buf).unwrap());
             list.SetComputeRootUnorderedAccessView(1, crate::hle::d3d12x::real::uma_va_of(res_buf).unwrap());
@@ -4307,6 +4689,25 @@ fn ds_addtid_translates_with_m0_offset_and_lane_id() {
     assert_eq!(tg.unsupported.get("ds_read_addtid_b32"), Some(&1), "{:?}", tg.unsupported);
     assert!(tg.hlsl.contains("GDS"), "{}", tg.hlsl);
     assert!(!tg.hlsl.contains("groupshared uint xcl_lds"), "{}", tg.hlsl);
+}
+
+/// `GDS=1` on any LDS-memory DS instruction (not only the ADDTID forms) addresses the global
+/// data share, not the group's LDS: it is reported as unsupported and allocates no LDS.
+#[test]
+fn ds_gds_plain_forms_are_unsupported() {
+    for (op, fields) in [
+        ("DS_ADD_U32", &[("ADDR", 1), ("DATA0", 2), ("GDS", 1)][..]),
+        ("DS_WRITE_B32", &[("ADDR", 1), ("DATA0", 2), ("GDS", 1)][..]),
+        ("DS_READ_B32", &[("ADDR", 1), ("VDST", 3), ("GDS", 1)][..]),
+    ] {
+        let mut code = Vec::new();
+        code.extend(encode(op, "ENC_DS", fields, None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let t = translate(&code, &Options::default()).unwrap();
+        assert_eq!(t.unsupported.get(op.to_lowercase().as_str()), Some(&1), "{op}: {:?}\n{}", t.unsupported, t.hlsl);
+        assert!(t.hlsl.contains("GDS"), "{op}: {}", t.hlsl);
+        assert!(!t.hlsl.contains("groupshared uint xcl_lds"), "{op}: {}", t.hlsl);
+    }
 }
 
 /// GPU verification for `DS_WRITE_ADDTID_B32` / `DS_READ_ADDTID_B32`: verifies exact LDS byte
@@ -5097,9 +5498,10 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
     assert_eq!(r.sgpr[106] | r.sgpr[107], 0, "v_div_scale_f32: VCC 0 (no post-scale)");
 }
 
-/// *_atomic_fcmpswap_x2 on hardware: a bitwise 64-bit compare-swap. A compare value equal
-/// as a float but different in bits (-0.0 vs +0.0) must NOT swap; GLC returns the old qword.
-/// Per-lane cells are deterministic; the three shared cells end in the unique winner's value.
+/// *_atomic_fcmpswap_x2 on hardware: IEEE-754 64-bit float compare-swap (XCL-BT-042).
+/// `-0.0 == +0.0` swaps (returning the pre-swap zero's sign bits), `NaN == NaN` keeps, and GLC
+/// returns the old qword. Per-lane cells are deterministic; the three shared cells end in the
+/// unique winner's value.
 #[test]
 fn gpu_atomic_fcmpswap_x2() {
     if !gpu_ready() {
@@ -5126,7 +5528,15 @@ fn gpu_atomic_fcmpswap_x2() {
     st.sgpr[8..12].copy_from_slice(&[0x600, 0, 0x200, 0]); // V#: base, stride/flags, records, –
     st.sgpr[12..16].copy_from_slice(&[0xC00, 0, 0x200, 0]);
     const INIT: u64 = 0x3FF8_0000_0000_0000; // f64 bits of 1.5
-    const NEG_ZERO: u64 = 0x8000_0000_0000_0000; // -0.0: == +0.0 numerically, different bits
+    const NEG_ZERO: u64 = 0x8000_0000_0000_0000; // -0.0
+    const QNAN: u64 = 0x7FF8_0000_0000_0000; // qNaN
+    // (initial cell, cmp, swaps)
+    let lane_case = |l: usize| match l % 4 {
+        0 => (INIT, INIT, true),
+        1 => (0u64, NEG_ZERO, true),
+        2 => (NEG_ZERO, 0u64, true),
+        _ => (QNAN, QNAN, false),
+    };
     let newv = |tag: u64, l: u64| tag << 48 | l;
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         let l64 = l as u64;
@@ -5134,9 +5544,7 @@ fn gpu_atomic_fcmpswap_x2() {
         r[14] = 0x800 + 8 * l as u32;
         r[22] = 8 * l as u32; // + s2 -> 0xA00 + 8·lane
         r[10] = 0xE00; // flat shared cell (all lanes)
-        // even lanes: cell = INIT, cmp = INIT -> swap happens; odd lanes: cell = +0.0, cmp =
-        // -0.0 -> bitwise different -> no swap (a numeric compare would swap)
-        let cmp = if l % 2 == 0 { INIT } else { NEG_ZERO };
+        let (_, cmp, _) = lane_case(l);
         let put = |r: &mut Vec<u32>, at: usize, v: u64| {
             r[at] = v as u32;
             r[at + 1] = (v >> 32) as u32;
@@ -5156,7 +5564,7 @@ fn gpu_atomic_fcmpswap_x2() {
     }
     let mut mem = vec![0u32; 0x1400 / 4];
     for l in 0..64usize {
-        let b = if l % 2 == 0 { INIT } else { 0 };
+        let (b, _, _) = lane_case(l);
         for a in [0x600 + 8 * l, 0x800 + 8 * l, 0xA00 + 8 * l] {
             mem[a / 4] = b as u32;
             mem[a / 4 + 1] = (b >> 32) as u32;
@@ -5171,26 +5579,162 @@ fn gpu_atomic_fcmpswap_x2() {
     let cell = |a: usize| r.mem[a / 4] as u64 | (r.mem[a / 4 + 1] as u64) << 32;
     for l in 0..64usize {
         let v = &r.vgpr[l];
-        let even = l % 2 == 0;
         let l64 = l as u64;
-        // per-lane cells: swapped iff cmp == cell bits
-        let (bs, fs, gs) = if even { (newv(0xB000, l64), newv(0xF000, l64), newv(0xA000, l64)) } else { (0, 0, 0) };
-        let cmp_old = if even { INIT } else { 0 }; // the cell's pre-swap value
+        let (init_cell, cmp, swaps) = lane_case(l);
+        let (bs, fs, gs) = if swaps { (newv(0xB000, l64), newv(0xF000, l64), newv(0xA000, l64)) } else { (init_cell, init_cell, init_cell) };
         assert_eq!(cell(0x600 + 8 * l), bs, "lane {l}: buffer cell");
         assert_eq!(cell(0x800 + 8 * l), fs, "lane {l}: flat cell");
         assert_eq!(cell(0xA00 + 8 * l), gs, "lane {l}: global cell");
         // GLC old value: VDATA in place for buffer, VDST for flat / global
-        assert_eq!(old(v, 4), cmp_old, "lane {l}: buffer GLC old");
-        assert_eq!(old(v, 12), cmp_old, "lane {l}: flat GLC old");
-        assert_eq!(old(v, 20), cmp_old, "lane {l}: global GLC old");
+        assert_eq!(old(v, 4), init_cell, "lane {l}: buffer GLC old");
+        assert_eq!(old(v, 12), init_cell, "lane {l}: flat GLC old");
+        assert_eq!(old(v, 20), init_cell, "lane {l}: global GLC old");
         // the compare register half is untouched
-        assert_eq!(old(v, 6), if even { INIT } else { NEG_ZERO }, "lane {l}: buffer cmp regs");
+        assert_eq!(old(v, 6), cmp, "lane {l}: buffer cmp regs");
     }
     // shared cells: exactly one lane sees INIT (the winner); the cell holds its value
     for (i, (dst, a, tag)) in [(30, 0xC00usize, 0x5B00u64), (40, 0xE00, 0x5F00), (44, 0x1200, 0x5A00)].iter().enumerate() {
         let winners: Vec<usize> = r.vgpr.iter().enumerate().filter(|(_, v)| old(v, *dst) == INIT).map(|(l, _)| l).collect();
         assert_eq!(winners.len(), 1, "shared cell {i}: exactly one lane wins the swap");
         assert_eq!(cell(*a), newv(*tag, winners[0] as u64), "shared cell {i}: the winner's value landed");
+    }
+}
+
+/// Float compare-and-swap atomics across LDS (`ds_cmpst_rtn_f32`), buffer/global/flat 32-bit and
+/// 64-bit (`*_atomic_fcmpswap`, `*_atomic_fcmpswap_x2`), and image UAV (`image_atomic_fcmpswap`)
+/// use IEEE-754 float equality (`-0.0 == +0.0` swaps, `qNaN == qNaN` and `sNaN == sNaN` keep,
+/// denormal != `+0.0`), while integer `cmpswap` / `ds_cmpst_rtn_b32` controls remain bitwise.
+/// Verified on the GPU through both HLSL and Direct DXIL (`XCL-BT-042`).
+#[test]
+fn gpu_float_cas_uses_ieee_equality() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+    let enc = |n: &'static str, e: &'static str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut code = Vec::new();
+    // Initialize LDS float and int-control cells with init32 (v10)
+    code.extend(enc("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 10)]));
+    code.extend(enc("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 10)]));
+    // 1) LDS: DS_CMPST_RTN_F32 (DATA0=cmp v11, DATA1=new v12) + bitwise DS_CMPST_RTN_B32 control
+    code.extend(enc("DS_CMPST_RTN_F32", "ENC_DS", &[("VDST", 22), ("ADDR", 0), ("DATA0", 11), ("DATA1", 12)]));
+    code.extend(enc("DS_READ_B32", "ENC_DS", &[("VDST", 23), ("ADDR", 0)]));
+    code.extend(enc("DS_CMPST_RTN_B32", "ENC_DS", &[("VDST", 24), ("ADDR", 1), ("DATA0", 11), ("DATA1", 12)]));
+    code.extend(enc("DS_READ_B32", "ENC_DS", &[("VDST", 25), ("ADDR", 1)]));
+    // 2) 32-bit buffer / global / flat float CAS + global bitwise control
+    code.extend(enc("BUFFER_ATOMIC_FCMPSWAP", "ENC_MUBUF", &[("VDATA", 14), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1), ("GLC", 1)]));
+    code.extend(enc("GLOBAL_ATOMIC_FCMPSWAP", "ENC_FLAT_GLBL", &[("VDST", 26), ("ADDR", 0), ("DATA", 16), ("SADDR", 4), ("GLC", 1)]));
+    code.extend(enc("FLAT_ATOMIC_FCMPSWAP", "ENC_FLAT", &[("VDST", 27), ("ADDR", 2), ("DATA", 16), ("GLC", 1)]));
+    code.extend(enc("GLOBAL_ATOMIC_CMPSWAP", "ENC_FLAT_GLBL", &[("VDST", 28), ("ADDR", 0), ("DATA", 16), ("SADDR", 6), ("GLC", 1)]));
+    // 3) 32-bit image UAV float CAS + bitwise control (64x1 R32_UINT UAVs)
+    code.extend(enc("IMAGE_ATOMIC_FCMPSWAP", "ENC_MIMG", &[("VDATA", 18), ("VADDR", 8), ("SRSRC", 6), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(enc("IMAGE_ATOMIC_CMPSWAP", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 8), ("SRSRC", 8), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    // 4) 64-bit buffer / global / flat float CAS + global bitwise control
+    code.extend(enc("BUFFER_ATOMIC_FCMPSWAP_X2", "ENC_MUBUF", &[("VDATA", 30), ("VADDR", 4), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1), ("GLC", 1)]));
+    code.extend(enc("GLOBAL_ATOMIC_FCMPSWAP_X2", "ENC_FLAT_GLBL", &[("VDST", 40), ("ADDR", 4), ("DATA", 34), ("SADDR", 16), ("GLC", 1)]));
+    code.extend(enc("FLAT_ATOMIC_FCMPSWAP_X2", "ENC_FLAT", &[("VDST", 42), ("ADDR", 6), ("DATA", 34), ("GLC", 1)]));
+    code.extend(enc("GLOBAL_ATOMIC_CMPSWAP_X2", "ENC_FLAT_GLBL", &[("VDST", 44), ("ADDR", 4), ("DATA", 34), ("SADDR", 18), ("GLC", 1)]));
+    code.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+
+    // 8 IEEE-754 edge cases: (init32, cmp32, init64, cmp64, float_swaps, int_swaps)
+    const CASES: [(u32, u32, u64, u64, bool, bool); 8] = [
+        (0x8000_0000, 0x0000_0000, 0x8000_0000_0000_0000, 0x0000_0000_0000_0000, true, false),  // -0.0 vs +0.0
+        (0x0000_0000, 0x8000_0000, 0x0000_0000_0000_0000, 0x8000_0000_0000_0000, true, false),  // +0.0 vs -0.0
+        (0x7FC0_0000, 0x7FC0_0000, 0x7FF8_0000_0000_0000, 0x7FF8_0000_0000_0000, false, true),  // qNaN vs qNaN
+        (0x7F80_0001, 0x7F80_0001, 0x7FF0_0000_0000_0001, 0x7FF0_0000_0000_0001, false, true),  // sNaN vs sNaN
+        (0x0000_0001, 0x0000_0000, 0x0000_0000_0000_0001, 0x0000_0000_0000_0000, false, false), // denorm vs +0.0
+        (0x3FC0_0000, 0x3FC0_0000, 0x3FF8_0000_0000_0000, 0x3FF8_0000_0000_0000, true, true),   // 1.5 vs 1.5
+        (0x3FC0_0000, 0x4020_0000, 0x3FF8_0000_0000_0000, 0x4004_0000_0000_0000, false, false), // 1.5 vs 2.5
+        (0xFF80_0000, 0xFF80_0000, 0xFFF0_0000_0000_0000, 0xFFF0_0000_0000_0000, true, true),   // -inf vs -inf
+    ];
+    const NEW32: u32 = 0x3F80_0000; // 1.0f
+    const NEW64: u64 = 0x3FF0_0000_0000_0000; // 1.0
+
+    let mut st = KernelState::default();
+    st.sgpr[4] = 0x0400;
+    st.sgpr[6] = 0x0600;
+    st.sgpr[8..12].copy_from_slice(&[0x0200, 0, 0x100, 0]);
+    st.sgpr[12..16].copy_from_slice(&[0x0A00, 0, 0x200, 0]);
+    st.sgpr[16] = 0x0C00;
+    st.sgpr[18] = 0x1000;
+    st.sgpr[24..32].copy_from_slice(&tsharp(0, 20, 9));
+    st.sgpr[32..40].copy_from_slice(&tsharp(2, 20, 9));
+
+    let mut mem = vec![0u32; 0x1400 / 4];
+    let mut tex_init = Vec::with_capacity(64 * 4);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (init32, cmp32, init64, cmp64, _, _) = CASES[l % CASES.len()];
+        let off32 = 4 * l as u32;
+        let off64 = 8 * l as u32;
+        r[0] = off32;
+        r[1] = 0x100 + off32;
+        r[2] = 0x0500 + off32;
+        r[4] = off64;
+        r[6] = 0x0E00 + off64;
+        r[8] = l as u32;
+        r[9] = 0;
+        r[10] = init32;
+        r[11] = cmp32;
+        r[12] = NEW32;
+        for base_v in [14, 16, 18, 20] {
+            r[base_v] = NEW32;
+            r[base_v + 1] = cmp32;
+        }
+        for base_v in [30, 34] {
+            r[base_v] = NEW64 as u32;
+            r[base_v + 1] = (NEW64 >> 32) as u32;
+            r[base_v + 2] = cmp64 as u32;
+            r[base_v + 3] = (cmp64 >> 32) as u32;
+        }
+        for a in [0x0200 + 4 * l, 0x0400 + 4 * l, 0x0500 + 4 * l, 0x0600 + 4 * l] {
+            mem[a / 4] = init32;
+        }
+        for a in [0x0A00 + 8 * l, 0x0C00 + 8 * l, 0x0E00 + 8 * l, 0x1000 + 8 * l] {
+            mem[a / 4] = init64 as u32;
+            mem[a / 4 + 1] = (init64 >> 32) as u32;
+        }
+        tex_init.extend_from_slice(&init32.to_le_bytes());
+    }
+    let tex = vec![
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 64, height: 1, depth: 1, texel_bytes: 4, data: tex_init.clone(), uav: true },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 64, height: 1, depth: 1, texel_bytes: 4, data: tex_init, uav: true },
+    ];
+
+    let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    let hlsl_dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|x| format!("{x}\n--- HLSL ---\n{}", t.hlsl)).unwrap();
+    let direct_dxil = runner::direct_kernel_full(&code, true).unwrap().dxil;
+
+    for (backend, dxil) in [("hlsl", hlsl_dxil), ("direct_dxil", direct_dxil)] {
+        let r = runner::run_with_statics(&dxil, &st, &mem, &tex, &[], &[]).unwrap_or_else(|e| panic!("{backend}: {e}"));
+        let old64 = |v: &[u32], at: usize| v[at] as u64 | (v[at + 1] as u64) << 32;
+        let cell64 = |a: usize| r.mem[a / 4] as u64 | (r.mem[a / 4 + 1] as u64) << 32;
+        let tex32 = |ti: usize, l: usize| u32::from_le_bytes(r.textures[ti][4 * l..4 * l + 4].try_into().unwrap());
+        for l in 0..64usize {
+            let (init32, _, init64, _, fswap, iswap) = CASES[l % CASES.len()];
+            let want_f32 = if fswap { NEW32 } else { init32 };
+            let want_i32 = if iswap { NEW32 } else { init32 };
+            let want_f64 = if fswap { NEW64 } else { init64 };
+            let want_i64 = if iswap { NEW64 } else { init64 };
+            let v = &r.vgpr[l];
+            // 1) LDS
+            assert_eq!((v[22], v[23]), (init32, want_f32), "{backend} lane {l} case {}: ds_cmpst_rtn_f32 (old, cell)", l % 8);
+            assert_eq!((v[24], v[25]), (init32, want_i32), "{backend} lane {l} case {}: ds_cmpst_rtn_b32 control (old, cell)", l % 8);
+            // 2) 32-bit buffer / global / flat + int control
+            assert_eq!((v[14], r.mem[(0x0200 + 4 * l) / 4]), (init32, want_f32), "{backend} lane {l} case {}: buffer_atomic_fcmpswap", l % 8);
+            assert_eq!((v[26], r.mem[(0x0400 + 4 * l) / 4]), (init32, want_f32), "{backend} lane {l} case {}: global_atomic_fcmpswap", l % 8);
+            assert_eq!((v[27], r.mem[(0x0500 + 4 * l) / 4]), (init32, want_f32), "{backend} lane {l} case {}: flat_atomic_fcmpswap", l % 8);
+            assert_eq!((v[28], r.mem[(0x0600 + 4 * l) / 4]), (init32, want_i32), "{backend} lane {l} case {}: global_atomic_cmpswap control", l % 8);
+            // 3) 32-bit image UAV + int control
+            assert_eq!((v[18], tex32(0, l)), (init32, want_f32), "{backend} lane {l} case {}: image_atomic_fcmpswap", l % 8);
+            assert_eq!((v[20], tex32(1, l)), (init32, want_i32), "{backend} lane {l} case {}: image_atomic_cmpswap control", l % 8);
+            // 4) 64-bit buffer / global / flat + int control
+            assert_eq!((old64(v, 30), cell64(0x0A00 + 8 * l)), (init64, want_f64), "{backend} lane {l} case {}: buffer_atomic_fcmpswap_x2", l % 8);
+            assert_eq!((old64(v, 40), cell64(0x0C00 + 8 * l)), (init64, want_f64), "{backend} lane {l} case {}: global_atomic_fcmpswap_x2", l % 8);
+            assert_eq!((old64(v, 42), cell64(0x0E00 + 8 * l)), (init64, want_f64), "{backend} lane {l} case {}: flat_atomic_fcmpswap_x2", l % 8);
+            assert_eq!((old64(v, 44), cell64(0x1000 + 8 * l)), (init64, want_i64), "{backend} lane {l} case {}: global_atomic_cmpswap_x2 control", l % 8);
+        }
     }
 }
 
@@ -6099,75 +6643,6 @@ fn far_jumps_are_direct_branches() {
     }
 }
 
-/// A branch (direct or resolved far jump) entering a far-jump sequence after `s_getpc_b64`
-/// bypasses its PC initialization, so the `s_setpc_b64` must stay indirect (`far_target == None`).
-/// Branching to the `s_getpc_b64` entry itself still runs the full sequence and stays direct.
-#[test]
-fn far_jumps_stay_indirect_when_branched_into() {
-    let decode_and_resolve = |code: &[u8]| {
-        let mut v = Vec::new();
-        let mut off = 0;
-        while off + 4 <= code.len() {
-            let d = crate::gpu::rdna2::decode(&code[off..], off as u64).unwrap();
-            off += d.len;
-            v.push(d);
-        }
-        crate::gpu::rdna2::resolve_far_jumps(&mut v);
-        v
-    };
-
-    // Layout: [0] S_CBRANCH_SCC1 simm16 (4 B, pc=0)
-    //         [1] S_GETPC_B64 s[4:5]   (4 B, pc=4)
-    //         [2] S_ADD/SUB_U32 s4,s4,lit (8 B, pc=8)
-    //         [3] S_ADDC/SUBB_U32 s5,s5,0 (4 B, pc=16)
-    //         [4] S_SETPC_B64 s[4:5]   (4 B, pc=20)
-    //         [5] S_NOP 0              (4 B, pc=24)
-    for sub in [false, true] {
-        let (lo, hi) = if sub { ("S_SUB_U32", "S_SUBB_U32") } else { ("S_ADD_U32", "S_ADDC_U32") };
-        let offset = if sub { 4u32 } else { 16u32 };
-        let expected_target = if sub { 4u64 } else { 24u64 };
-
-        // Branch target PC = 4 + simm16 * 4:
-        //   simm16 = 0 -> pc=4  (S_GETPC_B64, valid entry -> stays direct)
-        //   simm16 = 1 -> pc=8  (lo add/sub, interior -> must stay indirect)
-        //   simm16 = 3 -> pc=16 (hi addc/subb, interior -> must stay indirect)
-        //   simm16 = 4 -> pc=20 (S_SETPC_B64, interior -> must stay indirect)
-        for (simm16, expect_direct) in [(0u64, true), (1, false), (3, false), (4, false)] {
-            let code = prog(&[
-                ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", simm16)], None),
-                ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 4)], None),
-                (lo, "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 255)], Some(offset)),
-                (hi, "ENC_SOP2", &[("SDST", 5), ("SSRC0", 5), ("SSRC1", 128)], None),
-                ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 4)], None),
-                ("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None),
-            ]);
-            let insts = decode_and_resolve(&code);
-            let want = expect_direct.then_some(expected_target);
-            assert_eq!(insts[4].far_target, want, "sub={sub} simm16={simm16}");
-        }
-    }
-
-    // Far-to-far edge: sequence A (pc=0..20) resolves to pc=24, which is the `lo` instruction
-    // inside sequence B (pc=20..40). Sequence A remains direct; sequence B must stay indirect.
-    //   A: [0] GETPC (pc=0, base=4), [1] ADD +20 (pc=4, 8B), [2] ADDC 0 (pc=12), [3] SETPC (pc=16) -> target 24
-    //   B: [4] GETPC (pc=20, base=24), [5] ADD +16 (pc=24, 8B), [6] ADDC 0 (pc=32), [7] SETPC (pc=36) -> target 40
-    //      [8] S_NOP (pc=40)
-    let far_to_far = prog(&[
-        ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 4)], None),
-        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 255)], Some(20)),
-        ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 5), ("SSRC1", 128)], None),
-        ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 4)], None),
-        ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 6)], None),
-        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 6), ("SSRC1", 255)], Some(16)),
-        ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 7), ("SSRC0", 7), ("SSRC1", 128)], None),
-        ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)], None),
-        ("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None),
-    ]);
-    let insts = decode_and_resolve(&far_to_far);
-    assert_eq!(insts[3].far_target, Some(24), "first far jump A stays direct");
-    assert_eq!(insts[7].far_target, None, "second far jump B targeted inside its interior stays indirect");
-}
-
 /// Mesh mode for a GPU with 32-lane waves only: the console's two wave64s per group as four
 /// hardware wave32s exchanging masks and lane reads (counter-paired: two console waves),
 /// programs with cross-half operations included; native wave64 and wave32 programs unchanged.
@@ -6275,8 +6750,7 @@ fn gpu_split_wave64_lane_local_masks() {
     ]);
     if runner::split_wave64() {
         let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
-        // 3 live local masks (2 v_cmp + v_add_co carry-in); v_add_co_ci's dead carry-out elides its ballot.
-        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 3, "every live mask stays in its half");
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 4, "every mask stays in its half");
         assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 0);
     }
     let mut st = KernelState::default();
@@ -6300,6 +6774,140 @@ fn gpu_split_wave64_lane_local_masks() {
         let sum = a + ((7u64 << 32) | 0x20);
         assert_eq!((v[4], v[5]), (sum as u32, (sum >> 32) as u32), "lane {l}: 64-bit add with carry");
     }
+}
+
+/// Split-wave64 reduction-tail folding rules: 32-bit reduction tails, 64-bit `v_add_f64` tails,
+/// and direct `(L, L^32)` pairs fold into one `xcl_x_meet()`, while modifiers, mismatched lanes,
+/// `EXEC` writes, jump targets, and native wave64 stay untouched.
+#[test]
+fn split_wave64_reduction_tail_rules() {
+    let split = Options { mode: Mode::Kernel, wave64: true, split_wave64: true, ..Default::default() };
+
+    // 32-bit reduction tail: v_readlane(s8, v2, 32) ; v_min_u32 v2, s8, v2 ; v_readlane(s12, v2, 0)
+    let tail32 = prog(&[
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 128 + 32)], None),
+        ("V_MIN_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 8), ("VSRC1", 2)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", 128)], None),
+    ]);
+    let t = translate(&tail32, &split).unwrap();
+    assert_eq!(t.hlsl.matches("xcl_x_meet() ?").count(), 1 + 3, "1 folded meet + 3 in prelude:\n{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 0);
+
+    // Native wave64 is unchanged
+    let t_native = translate(&tail32, &Options { mode: Mode::Kernel, wave64: true, split_wave64: false, ..Default::default() }).unwrap();
+    assert!(!t_native.hlsl.contains("xcl_x_meet"));
+
+    // 64-bit v_add_f64 reduction tail: 4 readlanes -> 1 2-word meet
+    let tail64 = prog(&[
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 2), ("SRC1", 128 + 32)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 3), ("SRC1", 128 + 32)], None),
+        ("V_ADD_F64", "ENC_VOP3", &[("VDST", 2), ("SRC0", 2), ("SRC1", V + 2)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 2), ("SRC1", 128)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 3), ("SRC1", 128)], None),
+    ]);
+    let t = translate(&tail64, &split).unwrap();
+    assert_eq!(t.hlsl.matches("= xcl_x_meet();").count(), 1, "64-bit tail shares 1 meet");
+    assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 0);
+    assert!(t.hlsl.contains("#define XCL_X_SLOT 2u"));
+
+    // Direct (L, L^32) pair: 2 readlanes -> 1 meet
+    let direct = prog(&[
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 128 + 5)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 2), ("SRC1", 128 + 37)], None),
+    ]);
+    let t = translate(&direct, &split).unwrap();
+    assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 0);
+
+    // Negative guards: CLAMP modifier, mismatched lanes, jump target in middle
+    let clamped = prog(&[
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 128 + 32)], None),
+        ("V_ADD_F32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 8), ("SRC1", V + 2), ("CLAMP", 1)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", 128)], None),
+    ]);
+    assert_eq!(translate(&clamped, &split).unwrap().hlsl.matches("= xcl_x_rla_uniform(").count(), 2);
+
+    let mismatched = prog(&[
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 128 + 32)], None),
+        ("V_MIN_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 8), ("VSRC1", 2)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", 128 + 1)], None),
+    ]);
+    assert_eq!(translate(&mismatched, &split).unwrap().hlsl.matches("= xcl_x_rla_uniform(").count(), 2);
+
+    let branched = prog(&[
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 2)], None), // targets v_min_u32 (past 8-byte VOP3 readlane)
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 128 + 32)], None),
+        ("V_MIN_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 8), ("VSRC1", 2)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", 128)], None),
+    ]);
+    assert_eq!(translate(&branched, &split).unwrap().hlsl.matches("= xcl_x_rla_uniform(").count(), 2);
+}
+
+/// GPU verification of folded split-wave64 reduction tails: 32-bit `v_min_u32` / `v_add_f32` /
+/// `v_add_f16` (preserving high 16 bits), 64-bit `v_add_f64`, inactive lane 0 under `EXEC`, and
+/// direct `(L, L^32)` pair.
+#[test]
+fn gpu_split_wave64_reduction_tails() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        // 1. v_min_u32 reduction tail: v0[32] & v0[0] -> s10 = v0[32], s11 = min(v0[32], v0[0])
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", 128 + 32)], None),
+        ("V_MIN_U32", "ENC_VOP2", &[("VDST", 0), ("SRC0", 10), ("VSRC1", 0)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 0), ("SRC1", 128)], None),
+        // 2. v_add_f32 reduction tail (swapped operand order VOP3: v1, s12)
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", 128 + 32)], None),
+        ("V_ADD_F32", "ENC_VOP3", &[("VDST", 1), ("SRC0", V + 1), ("SRC1", 12)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 1), ("SRC1", 128)], None),
+        // 3. v_add_f16 reduction tail: high 16 bits of v2[0] must stay intact
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 2), ("SRC1", 128 + 32)], None),
+        ("V_ADD_F16", "ENC_VOP2", &[("VDST", 2), ("SRC0", 14), ("VSRC1", 2)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V + 2), ("SRC1", 128)], None),
+        // 4. 64-bit v_add_f64 reduction tail on v[4:5] -> s[16:17]
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 4), ("SRC1", 128 + 32)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 17), ("SRC0", V + 5), ("SRC1", 128 + 32)], None),
+        ("V_ADD_F64", "ENC_VOP3", &[("VDST", 4), ("SRC0", 16), ("SRC1", V + 4)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 4), ("SRC1", 128)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 17), ("SRC0", V + 5), ("SRC1", 128)], None),
+        // 5. Direct (lane 5, lane 37) pair on v6 -> s18, s19
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 6), ("SRC1", 128 + 5)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 19), ("SRC0", V + 6), ("SRC1", 128 + 37)], None),
+        // 6. Lane 0 masked off in EXEC: v_add_nc_u32 must NOT alter lane 0, so s21 stays old v7[0]
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 128)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 7), ("SRC1", 128 + 32)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 20), ("VSRC1", 7)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 7), ("SRC1", 128)], None),
+    ]);
+    if runner::split_wave64() {
+        let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+        assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 0, "all 6 patterns folded:\n{}", t.hlsl);
+    }
+    let mut st = KernelState::default();
+    let d0 = 123456.75f64.to_bits();
+    let d32 = 876543.125f64.to_bits();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = match l { 0 => 500, 32 => 123, _ => 999 };
+        r[1] = match l { 0 => 1.5f32.to_bits(), 32 => 2.25f32.to_bits(), _ => 0 };
+        // f16: 1.5 (0x3E00) + 2.5 (0x4100) = 4.0 (0x4400); high 16 bits = 0xCAFE on lane 0
+        r[2] = match l { 0 => 0xCAFE_3E00, 32 => 0xBEEF_4100, _ => 0 };
+        let db = match l { 0 => d0, 32 => d32, _ => 0 };
+        r[4] = db as u32;
+        r[5] = (db >> 32) as u32;
+        r[6] = 0x6000 + l as u32;
+        r[7] = match l { 0 => 0x1111, 32 => 0x2222, _ => 0 };
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    assert_eq!(r.sgpr[10], 123, "v_min_u32 s_tmp = v0[32]");
+    assert_eq!(r.sgpr[11], 123, "v_min_u32 s_out = min(500, 123)");
+    assert_eq!(r.vgpr[0][0], 123, "v0[0] updated in VGPR too");
+    assert_eq!(r.sgpr[13], 3.75f32.to_bits(), "v_add_f32 reduction");
+    assert_eq!(r.sgpr[15], 0xCAFE_4400, "v_add_f16 reduction preserves high 16 bits");
+    let got_d = (r.sgpr[16] as u64) | ((r.sgpr[17] as u64) << 32);
+    assert_eq!(got_d, (123456.75f64 + 876543.125f64).to_bits(), "v_add_f64 64-bit reduction");
+    assert_eq!(r.sgpr[18], 0x6005, "direct pair lane 5");
+    assert_eq!(r.sgpr[19], 0x6025, "direct pair lane 37");
+    assert_eq!(r.sgpr[20], 0x2222, "inactive-lane-0 s_tmp still reads lane 32");
+    assert_eq!(r.sgpr[21], 0x1111, "inactive-lane-0 s_out keeps unmodified old v7[0]");
 }
 
 /// Masks that are read whole after a write `x64_masks` must not take for an overwrite (an
@@ -6390,11 +6998,11 @@ fn gpu_split_wave64_masks_read_whole_after_partial_writes() {
         }
     }
     if runner::split_wave64() {
-        // v_cmp into NULL: nothing to exchange and dead carry/mask destination elides the ballot
+        // v_cmp into NULL: nothing to exchange
         let code = prog(&[("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 125), ("SRC0", V), ("SRC1", V + 1)], None)]);
         let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
         assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 0);
-        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 0);
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 1);
     }
 }
 
@@ -6460,8 +7068,7 @@ fn gpu_split_wave64_local_and_exchanged_masks_in_diverging_waves() {
         assert!(t.complete(), "{:?}", t.unsupported_why);
         if runner::split_wave64() {
             assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 1, "the v_cmp: read whole by the odd waves");
-            // 1 live carry (v_add_co -> v_add_co_ci); the final dead carry-out elides its ballot.
-            assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 1, "the live carry");
+            assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 2, "the carries");
         }
         let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
         let base = 0x100usize;
@@ -6631,7 +7238,10 @@ fn bench_split_wave64() {
                 t.sort_by(f64::total_cmp);
                 ms.push(t[t.len() / 2]);
             }
-            let form = if runner::split_wave64() { if threads > 64 { "split, counter-paired" } else { "split, barrier" } } else { "native" };
+            // the form `x64_spin` picks: counters for groups of more than one console wave,
+            // and by default for one as well (`XCL_WAVE64_SPIN=0`: a group barrier)
+            let spin = threads > 64 || std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0");
+            let form = if runner::split_wave64() { if spin { "split, counter-paired" } else { "split, barrier" } } else { "native" };
             println!(
                 "v_cmp + v_cndmask{}: {exchanges} exchange(s) / iteration, {threads} threads per group, 2^18 threads x {iterations} iterations: wave32 {:.1} ms, wave64 ({form}) {:.1} ms = {:.2}x",
                 if readfirstlane { " + v_readfirstlane" } else { "" },
@@ -7414,6 +8024,46 @@ fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
     assert_eq!(r.vgpr[2][0], 0x0000, "mad_nf_f16 cancellation: (1+2^-10)^2-(1+2^-9) -> 0 (not 2^-20)");
 }
 
+/// `exp mrtz` carries the sample mask in z (32-bit formats; Mesa, ac_nir_lower_ps_late.c
+/// `emit_ps_mrtz_export`), or in the low half of VSRC1 when compressed (UINT16_ABGR): it goes
+/// to SV_Coverage when the console's output signature has one. A depth-only PS is as before.
+#[test]
+fn ps_mrtz_sample_mask_writes_sv_coverage() {
+    use super::PsInterface;
+    let ps = |outputs: Vec<crate::gpu::dxbc::SigElement>, mrtz: &[(&str, u64)]| {
+        let code = prog(&[
+            ("EXP", "ENC_EXP", mrtz, None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let psi = PsInterface { inputs: vec![], outputs, input_ena: 0x2, attrs: None };
+        let pt = translate(&code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
+        assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+        }
+        pt.hlsl
+    };
+    let target = el("SV_Target", 0, 64, 3, 0, 0xF);
+    let h = ps(vec![target.clone(), el("SV_Coverage", 0, 66, 1, 0xFFFF_FFFF, 1)], &[("TGT", 8), ("EN", 0x4), ("VSRC2", 5)]);
+    assert!(h.contains("    uint xcl_mask : SV_Coverage;\n") && h.contains("    xo.xcl_mask = 0xFFFFFFFFu;\n") && h.contains("xo.xcl_mask = v5;"), "{h}");
+    // compressed: the mask in VSRC1 [15:0] (EN 0xC)
+    let h = ps(vec![target.clone(), el("SV_Coverage", 0, 66, 1, 0xFFFF_FFFF, 1)], &[("TGT", 8), ("EN", 0xC), ("COMPR", 1), ("VSRC0", 6), ("VSRC1", 5)]);
+    assert!(h.contains("    xo.xcl_mask = 0xFFFFFFFFu;\n") && h.contains("xo.xcl_mask = (v5 & 0xFFFFu);"), "{h}");
+    // SV_Coverage in the signature, but mrtz does not enable the mask channel: do not declare it (would zero every sample)
+    let h = ps(vec![target.clone(), el("SV_Depth", 0, 65, 3, 0xFFFF_FFFF, 1), el("SV_Coverage", 0, 66, 1, 0xFFFF_FFFF, 1)], &[("TGT", 8), ("EN", 0x1), ("VSRC0", 4)]);
+    assert!(!h.contains("SV_Coverage") && !h.contains("xcl_mask"), "{h}");
+    // coverage-only PS: XclOut has SV_Coverage and does not need the dummy target
+    let h = ps(vec![el("SV_Coverage", 0, 66, 1, 0xFFFF_FFFF, 1)], &[("TGT", 8), ("EN", 0x4), ("VSRC2", 5)]);
+    assert!(h.contains("    uint xcl_mask : SV_Coverage;\n") && !h.contains("xcl_unused"), "{h}");
+    // no SV_Coverage in the signature: nothing written
+    let h = ps(vec![target.clone()], &[("TGT", 8), ("EN", 0x4), ("VSRC2", 5)]);
+    assert!(!h.contains("SV_Coverage") && !h.contains("xcl_mask"), "{h}");
+    // depth only: the interface and the depth write of before
+    let h = ps(vec![target, el("SV_Depth", 0, 65, 3, 0xFFFF_FFFF, 1)], &[("TGT", 8), ("EN", 0x1), ("VSRC0", 4)]);
+    assert!(h.contains("struct XclOut {\n    float4 t0 : SV_Target0;\n    float xcl_depth : SV_Depth;\n};\n"), "{h}");
+    assert!(h.contains("{ xo.xcl_depth = asfloat(v4); }") && !h.contains("xcl_mask"), "{h}");
+}
+
 #[test]
 fn ps_interp_p0_preserves_bits_and_p2_converts_to_float() {
     use super::PsInterface;
@@ -7658,6 +8308,96 @@ fn gpu_fmt_encode_int_sat_and_f16_rtz() {
     assert_eq!(r.mem[0x204 / 4], 0x8000_7FFF, "16_16_SINT saturates (40000, -40000)");
     assert_eq!(r.mem[0x208 / 4], 0xFBFF_7BFF, "16_16_FLOAT saturates finite overflow to max finite");
     assert_eq!(r.mem[0x20C / 4], 0x3DF | (0x7C0 << 10) | (0x7BF << 21), "11_11_10_FLOAT saturates finite overflow and keeps +inf");
+}
+
+/// Direct DXIL and HLSL parity for `fmt_encode`: UINT/SINT saturation (`w < 32`), `w == 32`
+/// passthrough, and RTZ binary16 / 11_11_10_FLOAT rounding (`XCL-BT-026`, #1488, #1269).
+#[test]
+fn gpu_fmt_encode_direct_dxil_int_sat_and_f16_rtz() {
+    if !gpu_ready() {
+        return;
+    }
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let vs = |base: u32, fmt: u32| [base, 0, 0x100, ident | fmt << 12];
+    let p = prog(&[
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 0), ("SRSRC", 4), ("SOFFSET", 128)], None),    // 16_16_UINT
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 2), ("SRSRC", 5), ("SOFFSET", 128)], None),    // 16_16_SINT
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 4), ("SRSRC", 6), ("SOFFSET", 128)], None),  // 8_8_8_8_UINT
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 8), ("SRSRC", 7), ("SOFFSET", 128)], None),  // 8_8_8_8_SINT
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 12), ("SRSRC", 8), ("SOFFSET", 128)], None), // 2_10_10_10_SINT
+        ("BUFFER_STORE_FORMAT_X", "ENC_MUBUF", &[("VDATA", 16), ("SRSRC", 9), ("SOFFSET", 128)], None),    // 32_UINT
+        ("BUFFER_STORE_FORMAT_X", "ENC_MUBUF", &[("VDATA", 17), ("SRSRC", 10), ("SOFFSET", 128)], None),   // 32_SINT
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 18), ("SRSRC", 11), ("SOFFSET", 128)], None),  // 16_16_FLOAT overflow
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 20), ("SRSRC", 12), ("SOFFSET", 128)], None),  // 16_16_FLOAT normal RTZ
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 22), ("SRSRC", 13), ("SOFFSET", 128)], None),  // 16_16_FLOAT ±inf
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 24), ("SRSRC", 14), ("SOFFSET", 128)], None),  // 16_16_FLOAT subnormal RTZ / -0
+        ("BUFFER_STORE_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 26), ("SRSRC", 15), ("SOFFSET", 128)], None), // 11_11_10_FLOAT overflow + inf
+        ("BUFFER_STORE_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 29), ("SRSRC", 16), ("SOFFSET", 128)], None), // 11_11_10_FLOAT NaN / neg / RTZ
+    ]);
+    let mut st = KernelState::default();
+    let fmts = [
+        (4, 0x200, 27), (5, 0x204, 28), (6, 0x208, 60), (7, 0x20C, 61), (8, 0x210, 55),
+        (9, 0x214, 20), (10, 0x218, 21), (11, 0x21C, 29), (12, 0x220, 29), (13, 0x224, 29),
+        (14, 0x228, 29), (15, 0x22C, 43), (16, 0x230, 43),
+    ];
+    for (sr, base, fmt) in fmts {
+        st.sgpr[sr * 4..sr * 4 + 4].copy_from_slice(&vs(base, fmt));
+    }
+    for r in st.vgpr.iter_mut() {
+        r[0] = 70_000u32;
+        r[1] = u32::MAX;
+        r[2] = 40_000i32 as u32;
+        r[3] = (-40_000i32) as u32;
+        r[4] = 300u32;
+        r[5] = 255u32;
+        r[6] = 0u32;
+        r[7] = u32::MAX;
+        r[8] = 200i32 as u32;
+        r[9] = (-200i32) as u32;
+        r[10] = 127i32 as u32;
+        r[11] = (-128i32) as u32;
+        r[12] = 600i32 as u32;
+        r[13] = (-600i32) as u32;
+        r[14] = 0u32;
+        r[15] = (-3i32) as u32;
+        r[16] = 0xDEAD_BEEFu32;
+        r[17] = i32::MIN as u32;
+        r[18] = 65520.0f32.to_bits();
+        r[19] = (-65520.0f32).to_bits();
+        r[20] = 0x3F80_1800; // 1.0 + 0.75 * 2^-10: RNE -> 0x3C01, RTZ -> 0x3C00
+        r[21] = 0xBF80_1800; // -(1.0 + 0.75 * 2^-10): RNE -> 0xBC01, RTZ -> 0xBC00
+        r[22] = f32::INFINITY.to_bits();
+        r[23] = f32::NEG_INFINITY.to_bits();
+        r[24] = 0x3340_0000; // 0.75 * 2^-24: RNE -> 0x0001, RTZ -> 0x0000
+        r[25] = (-0.0f32).to_bits();
+        r[26] = 65520.0f32.to_bits();
+        r[27] = f32::INFINITY.to_bits();
+        r[28] = 65520.0f32.to_bits();
+        r[29] = f32::NAN.to_bits();
+        r[30] = (-1.0f32).to_bits();
+        r[31] = 0x3F81_F800; // 1.0 + 15.75 * 2^-10: RNE -> 0x3C10 (>>4 = 0x3C1), RTZ -> 0x3C0F (>>4 = 0x3C0)
+    }
+    let mem = vec![0u32; 0x100];
+    let t = translate(&p, &runner::options(Mode::Kernel)).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    let hlsl_dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let direct_dxil = runner::direct_kernel_full(&p, true).unwrap().dxil;
+    for (backend, dxil) in [("hlsl", hlsl_dxil), ("direct_dxil", direct_dxil)] {
+        let r = runner::run_with_statics(&dxil, &st, &mem, &[], &[], &[]).unwrap_or_else(|e| panic!("{backend}: {e}"));
+        assert_eq!(r.mem[0x200 / 4], 0xFFFF_FFFF, "{backend}: 16_16_UINT");
+        assert_eq!(r.mem[0x204 / 4], 0x8000_7FFF, "{backend}: 16_16_SINT");
+        assert_eq!(r.mem[0x208 / 4], 0xFF00_FFFF, "{backend}: 8_8_8_8_UINT");
+        assert_eq!(r.mem[0x20C / 4], 0x807F_807F, "{backend}: 8_8_8_8_SINT");
+        assert_eq!(r.mem[0x210 / 4], 0x1FF | (0x200 << 10) | (2 << 30), "{backend}: 2_10_10_10_SINT");
+        assert_eq!(r.mem[0x214 / 4], 0xDEAD_BEEF, "{backend}: 32_UINT passthrough");
+        assert_eq!(r.mem[0x218 / 4], i32::MIN as u32, "{backend}: 32_SINT passthrough");
+        assert_eq!(r.mem[0x21C / 4], 0xFBFF_7BFF, "{backend}: 16_16_FLOAT finite overflow RTZ");
+        assert_eq!(r.mem[0x220 / 4], 0xBC00_3C00, "{backend}: 16_16_FLOAT normal RTZ");
+        assert_eq!(r.mem[0x224 / 4], 0xFC00_7C00, "{backend}: 16_16_FLOAT ±inf");
+        assert_eq!(r.mem[0x228 / 4], 0x8000_0000, "{backend}: 16_16_FLOAT subnormal RTZ / -0.0");
+        assert_eq!(r.mem[0x22C / 4], 0x3DF | (0x7C0 << 10) | (0x7BF << 21), "{backend}: 11_11_10_FLOAT overflow + inf");
+        assert_eq!(r.mem[0x230 / 4], 0x3F0 | (0x3C0 << 21), "{backend}: 11_11_10_FLOAT NaN / neg / RTZ");
+    }
 }
 
 #[test]
@@ -8187,4 +8927,319 @@ fn jumps_to_outer_loop_heads_are_structured() {
     }
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
+}
+
+#[test]
+fn gpu_bvh_triangle_types_2_and_3() {
+    if !gpu_ready() {
+        return;
+    }
+    let base = 0x1000usize;
+    let mut mem = vec![0u32; 0x2000 / 4];
+    let w = |mem: &mut Vec<u32>, at: usize, vals: &[u32]| mem[(base + at) / 4..(base + at) / 4 + vals.len()].copy_from_slice(vals);
+    let ff = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    // 5 vertices at byte 0x100: v0=(0,0,1), v1=(2,0,1), v2=(1,2,1), v3=(3,2,2), v4=(1,4,3)
+    w(&mut mem, 0x100, &ff(&[0.0, 0.0, 1.0, 2.0, 0.0, 1.0, 1.0, 2.0, 1.0, 3.0, 2.0, 2.0, 1.0, 4.0, 3.0]));
+    w(&mut mem, 0x100 + 60, &[0x0909_0909]);
+    let node_base = 0x100u32 >> 3;
+    let (node2, node3) = (node_base | 2, node_base | 3);
+
+    let mimg = |n: &'static str, vdata: u64, vaddr: u64| encode(n, "ENC_MIMG", &[("VDATA", vdata), ("VADDR", vaddr), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
+    let mut code = Vec::new();
+    code.extend(mimg("IMAGE_BVH_INTERSECT_RAY", 100, 0));  // type 2 hit
+    code.extend(mimg("IMAGE_BVH_INTERSECT_RAY", 104, 20)); // type 3 hit
+    code.extend(mimg("IMAGE_BVH_INTERSECT_RAY", 108, 40)); // type 2 miss at type 0's center
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[(base >> 8) as u32, 0, u32::MAX, 0]);
+    let set_ray = |r: &mut Vec<u32>, at: usize, node: u32, ox: f32, oy: f32| {
+        r[at] = node;
+        let v = [100.0f32, ox, oy, 0.0, 0.0, 0.0, 1.0, f32::INFINITY, f32::INFINITY, 1.0];
+        for (k, x) in v.iter().enumerate() {
+            r[at + 1 + k] = x.to_bits();
+        }
+    };
+    for r in st.vgpr.iter_mut() {
+        set_ray(r, 0, node2, 5.0 / 3.0, 8.0 / 3.0);
+        set_ray(r, 20, node3, 2.0 / 3.0, 2.0);
+        set_ray(r, 40, node2, 1.0, 0.5);
+    }
+    let res = runner::run_code(&code, &st, &mem).unwrap();
+    let v = &res.vgpr[0];
+    let hit2 = [v[100], v[101], v[102], v[103]].map(f32::from_bits);
+    let hit3 = [v[104], v[105], v[106], v[107]].map(f32::from_bits);
+    let miss2 = [v[108], v[109], v[110], v[111]].map(f32::from_bits);
+    assert!(hit2[0].is_finite() && (hit2[0] / hit2[1] - 2.0).abs() < 1e-4, "gpu type 2 hit: {hit2:?}");
+    assert!(hit3[0].is_finite() && (hit3[0] / hit3[1] - 5.0 / 3.0).abs() < 1e-4, "gpu type 3 hit: {hit3:?}");
+    assert!(miss2[0].is_infinite(), "gpu type 2 must miss type 0's interior: {miss2:?}");
+}
+
+#[test]
+fn gpu_permlane16_wqm_and_lds_stride64() {
+    if !gpu_ready() {
+        return;
+    }
+    // Check S_WQM_B32 / S_WQM_B64 (including SCC = 0 on empty input), V_PERMLANE16_B32 /
+    // V_PERMLANEX16_B32 across FI / BOUND_CTRL with masked EXEC, and DS_*2ST64_B32 / _B64 in LDS.
+    let code = prog(&[
+        // Scalar WQM: non-zero and zero cases (s6..s9 read back before returning)
+        ("S_WQM_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 0)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 7), ("SSRC0", 129), ("SSRC1", 128)], None),
+        ("S_WQM_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 9), ("SSRC0", 129), ("SSRC1", 128)], None),
+        ("S_WQM_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 2)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 12), ("SSRC0", 129), ("SSRC1", 128)], None),
+        // LDS stride-64 dual writes and reads (base offset v3 = lane * 4 for b32, + 4096 for b64)
+        ("DS_WRITE2ST64_B32", "ENC_DS", &[("ADDR", 3), ("DATA0", 1), ("DATA1", 2), ("OFFSET0", 0), ("OFFSET1", 1)], None),
+        ("DS_WRITE2ST64_B64", "ENC_DS", &[("ADDR", 4), ("DATA0", 6), ("DATA1", 8), ("OFFSET0", 0), ("OFFSET1", 1)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("DS_READ2ST64_B32", "ENC_DS", &[("VDST", 10), ("ADDR", 3), ("OFFSET0", 0), ("OFFSET1", 1)], None),
+        ("DS_READ2ST64_B64", "ENC_DS", &[("VDST", 12), ("ADDR", 4), ("OFFSET0", 0), ("OFFSET1", 1)], None),
+        // Drop odd lanes from EXEC before permlane16/permlanex16 so inactive-source modes are exercised
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 14), ("SSRC0", 126)], None),
+        ("S_AND_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 20)], None),
+        // FI=0, BOUND_CTRL=0: reading an odd (inactive) source keeps old v20
+        ("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V), ("SRC1", 255), ("SRC2", 255), ("OP_SEL", 0)], Some(0x1111_1111)),
+        // FI=0, BOUND_CTRL=1: reading an odd (inactive) source returns 0
+        ("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V), ("SRC1", 255), ("SRC2", 255), ("OP_SEL", 2)], Some(0x1111_1111)),
+        // FI=1, BOUND_CTRL=0: fetch-inactive reads v0 even from inactive odd lane 1
+        ("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V), ("SRC1", 255), ("SRC2", 255), ("OP_SEL", 1)], Some(0x1111_1111)),
+        // Cross-row (other 16-lane row of each 32-lane half) reading even (active) lane 2
+        ("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 23), ("SRC0", V), ("SRC1", 255), ("SRC2", 255), ("OP_SEL", 0)], Some(0x2222_2222)),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 14)], None),
+    ]);
+
+    let mut st = KernelState::default();
+    st.sgpr[0] = 0x0002_0011; // quads 0, 1, 4 set -> 0x000F_00FF
+    st.sgpr[2] = 0x0000_0001; // quad 0 in lo
+    st.sgpr[3] = 0x8000_0000; // quad 7 in hi
+    st.sgpr[20] = 0x5555_5555; // even lanes active
+    st.sgpr[21] = 0x5555_5555;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = 1000 + l as u32;
+        r[1] = 200 + l as u32;
+        r[2] = 500 + l as u32;
+        r[3] = (l as u32) * 4;
+        r[4] = 4096 + (l as u32) * 8;
+        r[6] = 0x1000 + l as u32;
+        r[7] = 0x2000 + l as u32;
+        r[8] = 0x3000 + l as u32;
+        r[9] = 0x4000 + l as u32;
+        r[20] = 0xDEAD_0000 | l as u32;
+        r[21] = 0xBEEF_0000 | l as u32;
+        r[22] = 0xCAFE_0000 | l as u32;
+        r[23] = 0xFEED_0000 | l as u32;
+    }
+
+    let r = runner::run_program(&code, &st, &[]).unwrap().0;
+    assert_eq!((r.sgpr[6], r.sgpr[7]), (0x000F_00FF, 1), "s_wqm_b32 nonzero");
+    assert_eq!((r.sgpr[8], r.sgpr[9]), (0, 0), "s_wqm_b32 zero");
+    assert_eq!((r.sgpr[10], r.sgpr[11], r.sgpr[12]), (0x0000_000F, 0xF000_0000, 1), "s_wqm_b64");
+
+    for l in 0..64usize {
+        let v = &r.vgpr[l];
+        assert_eq!(v[10], st.vgpr[l][1], "lane {l} ds_read2st64_b32 off0");
+        assert_eq!(v[11], st.vgpr[l][2], "lane {l} ds_read2st64_b32 off1");
+        assert_eq!(v[12], st.vgpr[l][6], "lane {l} ds_read2st64_b64 off0 lo");
+        assert_eq!(v[13], st.vgpr[l][7], "lane {l} ds_read2st64_b64 off0 hi");
+        assert_eq!(v[14], st.vgpr[l][8], "lane {l} ds_read2st64_b64 off1 lo");
+        assert_eq!(v[15], st.vgpr[l][9], "lane {l} ds_read2st64_b64 off1 hi");
+
+        let half_base = l & !31;
+        let row_base = l & 16;
+        let other_row = row_base ^ 16;
+        if l % 2 == 0 {
+            // Even lanes were active; lane 1 in row is inactive, lane 2 in other row is active.
+            assert_eq!(v[20], st.vgpr[l][20], "lane {l} permlane16 bound=0 keeps vdst");
+            assert_eq!(v[21], 0, "lane {l} permlane16 bound=1 zeroes");
+            assert_eq!(v[22], st.vgpr[half_base | row_base | 1][0], "lane {l} permlane16 fi=1 fetches inactive");
+            assert_eq!(v[23], st.vgpr[half_base | other_row | 2][0], "lane {l} permlanex16 reads other row");
+        } else {
+            // Odd lanes were inactive under EXEC mask and retain original values.
+            assert_eq!(v[20], st.vgpr[l][20], "inactive lane {l} permlane16");
+            assert_eq!(v[21], st.vgpr[l][21], "inactive lane {l} permlane16 bound=1");
+            assert_eq!(v[22], st.vgpr[l][22], "inactive lane {l} permlane16 fi=1");
+            assert_eq!(v[23], st.vgpr[l][23], "inactive lane {l} permlanex16");
+        }
+    }
+}
+
+#[test]
+fn gpu_scalar_sext_mulhi_and_vector_i24_sub_co_ci_u64_shifts() {
+    if !gpu_ready() {
+        return;
+    }
+    let v = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3", f, None);
+    let code = prog(&[
+        // Scalar sign extension, abs (with SCC), and 32x32->hi32 multiplies
+        ("S_SEXT_I32_I8", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 0)], None),
+        ("S_SEXT_I32_I16", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 0)], None),
+        ("S_ABS_I32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 1)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 13), ("SSRC0", 129), ("SSRC1", 128)], None),
+        ("S_MUL_HI_U32", "ENC_SOP2", &[("SDST", 14), ("SSRC0", 2), ("SSRC1", 3)], None),
+        ("S_MUL_HI_I32", "ENC_SOP2", &[("SDST", 15), ("SSRC0", 2), ("SSRC1", 3)], None),
+        // Vector 32x32->hi32 and signed 24-bit multiply/mad
+        v("V_MUL_HI_U32", &[("VDST", 10), ("SRC0", V), ("SRC1", V + 1)]),
+        v("V_MUL_HI_I32", &[("VDST", 11), ("SRC0", V), ("SRC1", V + 1)]),
+        v("V_MUL_I32_I24", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", V + 3)]),
+        v("V_MUL_HI_I32_I24", &[("VDST", 13), ("SRC0", V + 2), ("SRC1", V + 3)]),
+        v("V_MAD_I32_I24", &[("VDST", 14), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", V + 4)]),
+        // 64-bit vector logical and arithmetic right shifts (including >= 32 shift amounts)
+        v("V_LSHRREV_B64", &[("VDST", 16), ("SRC0", V + 5), ("SRC1", V + 6)]),
+        v("V_ASHRREV_I64", &[("VDST", 18), ("SRC0", V + 5), ("SRC1", V + 6)]),
+        // Chained 64-bit subtraction with borrow across VOP3B (V_SUB_CO_CI_U32) and VOP2 (V_SUBREV_CO_CI_U32)
+        ("V_SUB_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 20), ("SDST", 20), ("SRC0", V + 6), ("SRC1", V + 8), ("SRC2", 22)], None),
+        ("V_SUB_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 21), ("SDST", 24), ("SRC0", V + 7), ("SRC1", V + 9), ("SRC2", 20)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 22), ("SRC0", V + 6)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 22)], None), // vcc = borrow-in
+        ("V_SUBREV_CO_CI_U32", "ENC_VOP2", &[("VDST", 22), ("SRC0", V + 8), ("VSRC1", 22)], None),
+    ]);
+
+    let mut st = KernelState::default();
+    st.sgpr[0] = 0x0000_80FE; // low byte -2, low 16 bits -32514
+    st.sgpr[1] = -42i32 as u32;
+    st.sgpr[2] = 0xFFFF_FFFE; // u32::MAX - 1, or -2i32
+    st.sgpr[3] = 0x8000_0003;
+    st.sgpr[22] = 0x5555_5555; // borrow-in = 1 on even lanes, 0 on odd lanes
+    st.sgpr[23] = 0x5555_5555;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = 0x8000_0000u32.wrapping_add(l as u32 * 0x0101_0001);
+        r[1] = 0xFFFF_FFFEu32.wrapping_sub(l as u32);
+        // i24 inputs with garbage upper 8 bits that must be ignored
+        r[2] = (0xAAu32 << 24) | if l % 2 == 0 { 0x00FF_FFF5 } else { 0x0000_0025 }; // -11 or +37
+        r[3] = (0x55u32 << 24) | if l % 3 == 0 { 0x0080_0000 } else { 0x0001_0003 }; // -8388608 or +65539
+        r[4] = 1000u32.wrapping_sub(l as u32 * 37);
+        r[5] = (l as u32) % 68; // tests shifts <32, ==32, >32 and modulo 64 masking
+        r[6] = 0x8765_4321u32.wrapping_sub(l as u32);
+        r[7] = if l % 2 == 0 { 0xF123_4567 } else { 0x7123_4567 };
+        r[8] = 0x8765_4321; // matches r[6] at lane 0 to force borrow propagation on borrow-in = 1
+        r[9] = 0x1000_0000;
+    }
+
+    let r = runner::run_program(&code, &st, &[]).unwrap().0;
+    assert_eq!(r.sgpr[10], -2i32 as u32, "s_sext_i32_i8");
+    assert_eq!(r.sgpr[11], -32514i32 as u32, "s_sext_i32_i16");
+    assert_eq!((r.sgpr[12], r.sgpr[13]), (42, 1), "s_abs_i32");
+    assert_eq!(
+        r.sgpr[14],
+        (((st.sgpr[2] as u64) * (st.sgpr[3] as u64)) >> 32) as u32,
+        "s_mul_hi_u32"
+    );
+    assert_eq!(
+        r.sgpr[15],
+        ((((st.sgpr[2] as i32) as i64) * ((st.sgpr[3] as i32) as i64)) >> 32) as u32,
+        "s_mul_hi_i32"
+    );
+
+    let sext24 = |x: u32| -> i64 { (((x << 8) as i32) >> 8) as i64 };
+    for l in 0..64usize {
+        let inp = &st.vgpr[l];
+        let v = &r.vgpr[l];
+        assert_eq!(v[10], (((inp[0] as u64) * (inp[1] as u64)) >> 32) as u32, "lane {l} v_mul_hi_u32");
+        assert_eq!(
+            v[11],
+            ((((inp[0] as i32) as i64) * ((inp[1] as i32) as i64)) >> 32) as u32,
+            "lane {l} v_mul_hi_i32"
+        );
+        let prod24 = sext24(inp[2]) * sext24(inp[3]);
+        assert_eq!(v[12], prod24 as u32, "lane {l} v_mul_i32_i24");
+        assert_eq!(v[13], (prod24 >> 32) as u32, "lane {l} v_mul_hi_i32_i24");
+        assert_eq!(v[14], (prod24 as i32).wrapping_add(inp[4] as i32) as u32, "lane {l} v_mad_i32_i24");
+
+        let val64 = ((inp[7] as u64) << 32) | (inp[6] as u64);
+        let sh = inp[5] & 63;
+        let lshr = val64 >> sh;
+        let ashr = ((val64 as i64) >> sh) as u64;
+        assert_eq!((v[16], v[17]), (lshr as u32, (lshr >> 32) as u32), "lane {l} v_lshrrev_b64");
+        assert_eq!((v[18], v[19]), (ashr as u32, (ashr >> 32) as u32), "lane {l} v_ashrrev_i64");
+
+        let borrow_in = if l % 2 == 0 { 1u128 } else { 0u128 };
+        let a64 = val64 as u128;
+        let b64 = (((inp[9] as u64) << 32) | (inp[8] as u64)) as u128;
+        let diff64 = a64.wrapping_sub(b64).wrapping_sub(borrow_in) as u64;
+        assert_eq!((v[20], v[21]), (diff64 as u32, (diff64 >> 32) as u32), "lane {l} v_sub_co_ci_u32");
+        let subrev = (inp[6] as u64).wrapping_sub(inp[8] as u64).wrapping_sub(borrow_in as u64) as u32;
+        assert_eq!(v[22], subrev, "lane {l} v_subrev_co_ci_u32");
+    }
+}
+
+/// image_get_resinfo with DIM 1D or 2D on a 2D MSAA T# (TYPE 14) or a 2D MSAA-array T# (TYPE 15)
+/// gives (width, height, 0, 1) on RDNA2 (AnyPS5#25723, gfx1036). A 4x2 texture of 4 samples, and
+/// a 4x2 array of 3 slices of 4 samples. The level count is 1 on every host: queried through a
+/// Texture2D handle, the multisampled view reported log2(samples) + 1 = 3 on RADV.
+#[test]
+fn gpu_image_get_resinfo_dim_2d_of_an_msaa_tsharp() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let mimg = |vdata: u64, srsrc: u64, dim: u64| encode("IMAGE_GET_RESINFO", "ENC_MIMG", &[("VDATA", vdata), ("VADDR", 3), ("SRSRC", srsrc), ("DMASK", 0xF), ("DIM", dim)], None).unwrap();
+    // T# 14 in s[16:23], T# 15 in s[24:31]; DIM 2D, then DIM 1D, on each
+    let mut code = Vec::new();
+    code.extend(mimg(20, 4, 1));
+    code.extend(mimg(24, 4, 0));
+    code.extend(mimg(28, 6, 1));
+    code.extend(mimg(32, 6, 0));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 14));
+    st.sgpr[24..32].copy_from_slice(&tsharp(2, 77, 15));
+    for r in st.vgpr.iter_mut() {
+        r[3] = 0;
+    }
+    let tex = [
+        TestTexture { dim: TexDim::D2Ms(4), format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 2, depth: 1, texel_bytes: 16, data: vec![0; 4 * 2 * 4 * 16], uav: false },
+        TestTexture { dim: TexDim::D2MsArray(4), format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 2, depth: 3, texel_bytes: 16, data: vec![0; 3 * 4 * 2 * 4 * 16], uav: false },
+    ];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    assert_eq!(&r.vgpr[0][20..24], &[4, 2, 0, 1], "resinfo (w, h, d, mips) of DIM 2D on a 4-sample T#");
+    assert_eq!(&r.vgpr[0][24..28], &[4, 2, 0, 1], "resinfo (w, h, d, mips) of DIM 1D on a 4-sample T#");
+    assert_eq!(&r.vgpr[0][28..32], &[4, 2, 0, 1], "resinfo (w, h, d, mips) of DIM 2D on a 4-sample array T#");
+    assert_eq!(&r.vgpr[0][32..36], &[4, 2, 0, 1], "resinfo (w, h, d, mips) of DIM 1D on a 4-sample array T#");
+}
+
+/// image_get_resinfo at a mip past the T#'s last level: RDNA2 gives 0 for width, height and
+/// depth or layers and the level count as usual (AnyPS5#22724, gfx1036; D3D12 GetDimensions
+/// zeroes them past the view's levels, so only channels the translators fill in can differ).
+/// Single-level 2D, 2D array, 3D and cube T#s queried at mips 0, 1, 2, 15 and 0xffffffff.
+#[test]
+fn gpu_image_get_resinfo_past_last_level() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let mimg = |vdata: u64, srsrc: u64, dim: u64| encode("IMAGE_GET_RESINFO", "ENC_MIMG", &[("VDATA", vdata), ("VADDR", 3), ("SRSRC", srsrc), ("DMASK", 0xF), ("DIM", dim)], None).unwrap();
+    // (name, VDATA, SRSRC, DIM, T# TYPE)
+    let cases: [(&str, u64, u64, u64, u32); 4] = [("2D", 20, 4, 1, 9), ("2D array", 24, 6, 5, 13), ("3D", 28, 8, 2, 10), ("cube", 32, 10, 3, 11)];
+    let mut code = Vec::new();
+    for &(_, vdata, srsrc, dim, _) in &cases {
+        code.extend(mimg(vdata, srsrc, dim));
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    for (i, &(_, _, srsrc, _, ty)) in cases.iter().enumerate() {
+        let s = 4 * srsrc as usize;
+        st.sgpr[s..s + 8].copy_from_slice(&tsharp(2 * i as u32, 77, ty));
+    }
+    let mips = [0u32, 1, 2, 15, 0xFFFF_FFFF];
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[3] = mips[l % mips.len()];
+    }
+    let t = |dim: TexDim, width: u32, height: u32, depth: u32| TestTexture { dim, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width, height, depth, texel_bytes: 16, data: vec![0; (width * height * depth * 16) as usize], uav: false };
+    let tex = [t(TexDim::D2, 8, 4, 1), t(TexDim::D2Array, 8, 4, 3), t(TexDim::D3, 8, 4, 2), t(TexDim::Cube, 4, 4, 12)];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    let mut bad = Vec::new();
+    for (l, &mip) in mips.iter().enumerate() {
+        for &(name, vdata, ..) in &cases {
+            let v = &r.vgpr[l][vdata as usize..vdata as usize + 4];
+            eprintln!("resinfo {name:9} mip {mip:#010x}: {v:?}");
+            if mip >= 1 && v != [0, 0, 0, 1] {
+                bad.push(format!("{name} mip {mip:#x}: {v:?}, RDNA2 gives [0, 0, 0, 1]"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "resinfo past the last level:\n{}", bad.join("\n"));
 }

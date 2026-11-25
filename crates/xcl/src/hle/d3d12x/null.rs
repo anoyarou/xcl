@@ -79,10 +79,10 @@ unsafe impl Send for NullObj {}
 
 static CREATED: AtomicU64 = AtomicU64::new(0);
 
+static TABLES: Mutex<Vec<(Kind, usize)>> = Mutex::new(Vec::new());
+
 fn vtable(kind: Kind) -> *const usize {
-    static TABLES: OnceLock<Mutex<Vec<(Kind, usize)>>> = OnceLock::new();
-    let t = TABLES.get_or_init(|| Mutex::new(Vec::new()));
-    let mut g = t.lock().unwrap();
+    let mut g = TABLES.lock().unwrap();
     if let Some(&(_, p)) = g.iter().find(|(k, _)| *k == kind) {
         return p as *const usize;
     }
@@ -264,14 +264,28 @@ unsafe extern "system" fn Ret_Zero(_t: *mut NullObj) -> usize {
     0
 }
 unsafe extern "system" fn Ret_Void(_t: *mut NullObj) {}
-/// Methods returning a 16-byte struct via hidden pointer (MSVC member-function ABI).
-unsafe extern "system" fn Hidden_ZeroDesc16(_t: *mut NullObj, ret: *mut u8) -> *mut u8 {
+/// The object and the return buffer of a method that returns a struct through a hidden pointer,
+/// called the C++ way (this, buffer) or the C way (buffer, this) as a retail game calls device
+/// #26 (`real::this_first`): the object is the one whose first word is a vtable made here.
+unsafe fn this_and_ret(a: *mut c_void, b: *mut c_void) -> (*mut NullObj, *mut u8) {
+    // (unaligned: the buffer of a 20-byte struct is aligned to 4)
+    let ours = |p: *mut c_void| !p.is_null() && TABLES.lock().unwrap().iter().any(|&(_, v)| v == (p as *const usize).read_unaligned());
+    if ours(b) && !ours(a) {
+        (b as *mut NullObj, a as *mut u8)
+    } else {
+        (a as *mut NullObj, b as *mut u8)
+    }
+}
+/// Methods returning a 16-byte struct via hidden pointer.
+unsafe extern "system" fn Hidden_ZeroDesc16(a: *mut c_void, b: *mut c_void) -> *mut u8 {
+    let (_, ret) = this_and_ret(a, b);
     if !ret.is_null() {
         std::ptr::write_bytes(ret, 0, 16);
     }
     ret
 }
-unsafe extern "system" fn Hidden_ZeroDesc40(_t: *mut NullObj, ret: *mut u8) -> *mut u8 {
+unsafe extern "system" fn Hidden_ZeroDesc40(a: *mut c_void, b: *mut c_void) -> *mut u8 {
+    let (_, ret) = this_and_ret(a, b);
     if !ret.is_null() {
         std::ptr::write_bytes(ret, 0, 40);
     }
@@ -436,14 +450,14 @@ unsafe fn approx_size(desc: *const u8) -> usize {
     if desc.is_null() {
         return 0x1000;
     }
-    let dim = (desc as *const u32).read_unaligned();
-    let width = (desc.add(16) as *const u64).read_unaligned() as usize;
+    let dim = *(desc as *const u32);
+    let width = *(desc.add(16) as *const u64) as usize;
     if dim == 1 {
         return width.max(1);
     }
-    let height = (desc.add(24) as *const u32).read_unaligned().max(1) as usize;
-    let depth = (desc.add(28) as *const u16).read_unaligned().max(1) as usize;
-    (width.max(1).saturating_mul(height).saturating_mul(depth).saturating_mul(16) / 3).min(256 << 20)
+    let height = (*(desc.add(24) as *const u32)).max(1) as usize;
+    let depth = (*(desc.add(28) as *const u16)).max(1) as usize;
+    (width.max(1) * height * depth * 4 * 4 / 3).min(256 << 20)
 }
 
 unsafe fn new_resource(desc: *const u8, ppv: *mut *mut c_void) -> HRESULT {
@@ -458,19 +472,17 @@ unsafe fn new_resource(desc: *const u8, ppv: *mut *mut c_void) -> HRESULT {
     *(*o).mem.lock().unwrap() = (0, size);
     // unique fake GPU VA (64 KiB aligned bump allocator)
     static NEXT_VA: AtomicU64 = AtomicU64::new(0x1_0000_0000);
-    let va = NEXT_VA.fetch_add((size as u64).saturating_add(0xFFFF) & !0xFFFF, Ordering::Relaxed);
+    let va = NEXT_VA.fetch_add(((size as u64) + 0xFFFF) & !0xFFFF, Ordering::Relaxed);
     (*o).value.store(va, Ordering::Relaxed);
     *ppv = o as *mut c_void;
     S_OK
 }
 
-unsafe extern "system" fn Device_GetResourceAllocationInfo(_t: *mut NullObj, ret: *mut u64, _mask: u32, n: u32, descs: *const u8) -> *mut u64 {
+unsafe extern "system" fn Device_GetResourceAllocationInfo(a: *mut c_void, b: *mut c_void, _mask: u32, n: u32, descs: *const u8) -> *mut u64 {
+    let ret = this_and_ret(a, b).1 as *mut u64;
     let mut total = 0usize;
-    if !descs.is_null() {
-        for i in 0..n as usize {
-            let aligned = approx_size(descs.add(i * 56)).saturating_add(0xFFFF) & !0xFFFF;
-            total = total.saturating_add(aligned);
-        }
+    for i in 0..n as usize {
+        total += (approx_size(descs.add(i * 56)) + 0xFFFF) & !0xFFFF;
     }
     if !ret.is_null() {
         *ret = total as u64;
@@ -478,7 +490,8 @@ unsafe extern "system" fn Device_GetResourceAllocationInfo(_t: *mut NullObj, ret
     }
     ret
 }
-unsafe extern "system" fn Device_GetCustomHeapProperties(_t: *mut NullObj, ret: *mut u8, _m: u32, ty: u32) -> *mut u8 {
+unsafe extern "system" fn Device_GetCustomHeapProperties(a: *mut c_void, b: *mut c_void, _m: u32, ty: u32) -> *mut u8 {
+    let (_, ret) = this_and_ret(a, b);
     if !ret.is_null() {
         std::ptr::write_bytes(ret, 0, 20);
         *(ret as *mut u32) = 4; // CUSTOM
@@ -526,32 +539,29 @@ unsafe extern "system" fn Device_GetCopyableFootprints(
     total: *mut u64,
 ) {
     let size = approx_size(desc) as u64;
-    let dim = if desc.is_null() { 0 } else { (desc as *const u32).read_unaligned() };
-    let width = if desc.is_null() { 1 } else { (desc.add(16) as *const u64).read_unaligned().max(1) };
-    let height = if desc.is_null() { 1 } else { (desc.add(24) as *const u32).read_unaligned().max(1) };
-    let format = if desc.is_null() { 0 } else { (desc.add(32) as *const u32).read_unaligned() };
-    let bpp = if dim == 1 { 1u64 } else { 4u64 };
-    let row_bytes = width.saturating_mul(bpp);
-    let row = (row_bytes.saturating_add(255) & !255).min((u32::MAX & !255) as u64) as u32;
+    let width = if desc.is_null() { 1 } else { (*(desc.add(16) as *const u64)).max(1) };
+    let height = if desc.is_null() { 1 } else { (*(desc.add(24) as *const u32)).max(1) };
+    let format = if desc.is_null() { 0 } else { *(desc.add(32) as *const u32) };
+    let row = ((width * 4 + 255) & !255) as u32;
     for i in 0..num as usize {
         if !layouts.is_null() {
             let l = layouts.add(i * 32);
-            (l as *mut u64).write_unaligned(base);
-            (l.add(8) as *mut u32).write_unaligned(format);
-            (l.add(12) as *mut u32).write_unaligned(width.min(u32::MAX as u64) as u32);
-            (l.add(16) as *mut u32).write_unaligned(height);
-            (l.add(20) as *mut u32).write_unaligned(1);
-            (l.add(24) as *mut u32).write_unaligned(row);
+            *(l as *mut u64) = base;
+            *(l.add(8) as *mut u32) = format;
+            *(l.add(12) as *mut u32) = width as u32;
+            *(l.add(16) as *mut u32) = height;
+            *(l.add(20) as *mut u32) = 1;
+            *(l.add(24) as *mut u32) = row;
         }
         if !num_rows.is_null() {
             *num_rows.add(i) = height;
         }
         if !row_sizes.is_null() {
-            *row_sizes.add(i) = row_bytes;
+            *row_sizes.add(i) = width * 4;
         }
     }
     if !total.is_null() {
-        *total = size.max((row as u64).saturating_mul(height as u64));
+        *total = size.max(row as u64 * height as u64);
     }
 }
 unsafe extern "system" fn Device_CreateQueryHeap(_t: *mut NullObj, _d: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
@@ -560,7 +570,8 @@ unsafe extern "system" fn Device_CreateQueryHeap(_t: *mut NullObj, _d: *const c_
 unsafe extern "system" fn Device_CreateCommandSignature(_t: *mut NullObj, _d: *const c_void, _rs: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     out_obj(ppv, Kind::CommandSignature)
 }
-unsafe extern "system" fn Device_GetAdapterLuid(_t: *mut NullObj, ret: *mut u64) -> *mut u64 {
+unsafe extern "system" fn Device_GetAdapterLuid(a: *mut c_void, b: *mut c_void) -> *mut u64 {
+    let ret = this_and_ret(a, b).1 as *mut u64;
     if !ret.is_null() {
         *ret = 0x5843_4C00;
     }
@@ -619,7 +630,8 @@ unsafe extern "system" fn Fence_Signal(this: *mut NullObj, value: u64) -> HRESUL
     (*this).value.store(value, Ordering::Release);
     S_OK
 }
-unsafe extern "system" fn Heap_GetDesc16(this: *mut NullObj, ret: *mut u8) -> *mut u8 {
+unsafe extern "system" fn Heap_GetDesc16(a: *mut c_void, b: *mut c_void) -> *mut u8 {
+    let (this, ret) = this_and_ret(a, b);
     if !ret.is_null() {
         std::ptr::copy_nonoverlapping((*this).desc.as_ptr(), ret, 16);
     }
@@ -646,7 +658,8 @@ unsafe extern "system" fn Resource_Map(this: *mut NullObj, _sub: u32, _range: *c
         S_OK
     }
 }
-unsafe extern "system" fn Resource_GetDesc(this: *mut NullObj, ret: *mut u8) -> *mut u8 {
+unsafe extern "system" fn Resource_GetDesc(a: *mut c_void, b: *mut c_void) -> *mut u8 {
+    let (this, ret) = this_and_ret(a, b);
     if !ret.is_null() {
         std::ptr::copy_nonoverlapping((*this).desc.as_ptr(), ret, 56);
     }
@@ -824,46 +837,36 @@ mod tests {
         }
     }
 
+    /// A retail game calls the device's struct-returning methods the C way (return buffer,
+    /// object): the result goes to the buffer and the object keeps its vtable pointer (#26's 20
+    /// bytes were written over the device, and its next call jumped through them).
     #[test]
-    fn null_alloc_info_and_footprints_guard_null_and_overflow() {
+    fn struct_returning_methods_take_the_buffer_first_or_second() {
         unsafe {
             let mut dev = std::ptr::null_mut();
             assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
-            let alloc_info: unsafe extern "system" fn(*mut c_void, *mut [u64; 2], u32, u32, *const u8) -> *mut [u64; 2] =
-                std::mem::transmute(slot(dev, 25));
-            // Null descs with n >= 2 must not compute null.add(56) and dereference 0x38.
-            let mut out = [99u64; 2];
-            alloc_info(dev, &mut out, 0, 2, std::ptr::null());
-            assert_eq!(out, [0, 0x10000]);
-
-            // Huge 2D dimensions in approx_size must saturate instead of panicking.
-            let mut huge_tex = [0u8; 56];
-            huge_tex[0..4].copy_from_slice(&3u32.to_le_bytes()); // TEXTURE2D
-            huge_tex[16..24].copy_from_slice(&(1u64 << 40).to_le_bytes());
-            huge_tex[24..28].copy_from_slice(&(1u32 << 24).to_le_bytes());
-            huge_tex[28..30].copy_from_slice(&16u16.to_le_bytes());
-            assert_eq!(approx_size(huge_tex.as_ptr()), 256 << 20);
-
-            // GetCopyableFootprints on a 1 GiB buffer must not truncate RowPitch to 0.
-            let footprints: unsafe extern "system" fn(*mut c_void, *const u8, u32, u32, u64, *mut u8, *mut u32, *mut u64, *mut u64) =
-                std::mem::transmute(slot(dev, 38));
-            let mut buf_desc = [0u8; 56];
-            buf_desc[0..4].copy_from_slice(&1u32.to_le_bytes()); // BUFFER
-            buf_desc[16..24].copy_from_slice(&(1u64 << 30).to_le_bytes());
-            buf_desc[24..28].copy_from_slice(&1u32.to_le_bytes());
-            let mut layout = [0u8; 32];
-            let mut row_size = 0u64;
-            let mut total = 0u64;
-            footprints(dev, buf_desc.as_ptr(), 0, 1, 0, layout.as_mut_ptr(), std::ptr::null_mut(), &mut row_size, &mut total);
-            let row_pitch = u32::from_le_bytes(layout[24..28].try_into().unwrap());
-            assert_eq!(row_pitch, 1u32 << 30, "1 GiB buffer RowPitch must not truncate to 0");
-            assert_eq!(row_size, 1u64 << 30);
-
-            // Extreme width in GetCopyableFootprints must saturate without overflow panic.
-            buf_desc[16..24].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
-            footprints(dev, buf_desc.as_ptr(), 0, 1, 0, layout.as_mut_ptr(), std::ptr::null_mut(), &mut row_size, &mut total);
-            let huge_pitch = u32::from_le_bytes(layout[24..28].try_into().unwrap());
-            assert_eq!(huge_pitch, u32::MAX & !255);
+            let vtbl = *(dev as *const usize);
+            let heap_properties: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) -> *mut c_void = std::mem::transmute(slot(dev, 26));
+            // the C way's buffer 4 past a multiple of 8, where a 20-byte struct's can be
+            let mut store = [!0u64; 4];
+            let c = (store.as_mut_ptr() as *mut u32).add(1) as *mut [u32; 5];
+            let mut cpp = [!0u32; 5];
+            assert_eq!(heap_properties(c as *mut c_void, dev, 1, 2), c as *mut c_void);
+            assert_eq!(*(dev as *const usize), vtbl, "the device's vtable pointer");
+            heap_properties(dev, cpp.as_mut_ptr() as *mut c_void, 1, 2);
+            assert_eq!((*c, (*c)[0]), (cpp, 4));
+            // one that reads its object: resource #10 GetDesc
+            let mut desc = [0u8; 56];
+            desc[0] = 1; // BUFFER
+            desc[16..24].copy_from_slice(&4096u64.to_le_bytes());
+            let create_res: unsafe extern "system" fn(*mut c_void, *const c_void, u32, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute(slot(dev, 27));
+            let mut r = std::ptr::null_mut();
+            assert_eq!(create_res(dev, std::ptr::null(), 0, desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut r), S_OK);
+            let get_desc: unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void = std::mem::transmute(slot(r, 10));
+            let mut got = [!0u8; 56];
+            get_desc(got.as_mut_ptr() as *mut c_void, r);
+            assert_eq!(got, desc);
         }
     }
 

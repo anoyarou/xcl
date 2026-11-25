@@ -85,6 +85,10 @@ unsafe fn wait_for_submission(
 
 fn init() -> Result<Gpu, String> {
     unsafe {
+        if crate::state::config().d3d12_debug || std::env::var_os("XCL_D3D12_DEBUG").is_some() {
+            // The debug layer must be enabled before this runner creates a device.
+            let _ = crate::gpu::agility::enable_debug_layer();
+        }
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(e)?;
         // `XCL_ADAPTER` picks the adapter (default: the first in high-performance order)
         let sel = crate::gpu::adapter::Selector::from_env_or("auto");
@@ -387,9 +391,9 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
                 uv.Anonymous.Buffer = D3D12_BUFFER_UAV { NumElements: t.width, ..Default::default() };
             }
         }
-        if !t.uav {
-            dev.CreateShaderResourceView(&r, Some(&sv), at(&heap, 2 * i, inc));
-        }
+        // a UAV texture has its SRV too, as D3D12.X gives a console image UAV a companion SRV
+        // (RDNA images have no SRV / UAV distinction: the shader may read the slot)
+        dev.CreateShaderResourceView(&r, Some(&sv), at(&heap, 2 * i, inc));
         if t.uav {
             dev.CreateUnorderedAccessView(&r, None::<&ID3D12Resource>, Some(&uv), at(&heap, 2 * i + 1, inc));
         }
@@ -1524,22 +1528,22 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         }
         // the windows as raw UAVs at MEM_HEAP_BASE.. of a shader-visible heap
         // (`Options::heap_windows`; programs with the root-UAV switch ignore it)
+        let win_count = arena.windows.len().clamp(crate::gpu::uma::MAX_WINDOWS, crate::gpu::uma::MAX_HEAP_WINDOWS);
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: super::MEM_HEAP_NULL + 1,
+                NumDescriptors: super::MEM_HEAP_BASE + win_count as u32,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
             .map_err(e)?;
         let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
-        for k in 0..4usize {
+        for k in 0..win_count {
             let (b, size) = bufs.get(k).map_or((&mem_buf, arena.windows[0].1), |b| (b, arena.windows[k].1));
             let mut h = dh.GetCPUDescriptorHandleForHeapStart();
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
             dev.CreateUnorderedAccessView(b, None::<&ID3D12Resource>, Some(&raw_window_uav(size as u64)), h);
         }
-        set_null_window_view(dev, dh.GetCPUDescriptorHandleForHeapStart(), inc);
         list.SetDescriptorHeaps(&[Some(dh.clone())]);
         list.SetComputeRootSignature(&gpu.rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
@@ -1586,17 +1590,6 @@ pub fn raw_window_uav(bytes: u64) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Buffer: D3D12_BUFFER_UAV { FirstElement: 0, NumElements: (bytes / 4) as u32, StructureByteStride: 0, CounterOffsetInBytes: 0, Flags: D3D12_BUFFER_UAV_FLAG_RAW },
         },
     }
-}
-
-/// The null raw UAV at `MEM_HEAP_NULL` of a heap starting at `start` (`Options::heap_windows`:
-/// accesses outside a program's windows select it – loads and atomics give 0, stores drop).
-///
-/// # Safety
-/// `start` is the CPU handle of a heap of `dev` with at least `MEM_HEAP_NULL + 1` descriptors
-/// of increment `inc`.
-pub unsafe fn set_null_window_view(dev: &ID3D12Device, start: D3D12_CPU_DESCRIPTOR_HANDLE, inc: usize) {
-    let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + super::MEM_HEAP_NULL as usize * inc };
-    dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&raw_window_uav(4)), at);
 }
 
 /// Create a committed resource from a description (validation of decoded descriptors).
@@ -1699,21 +1692,21 @@ fn dispatch_with(
         // A PSO built by the backend's hook uses the runtime's window count: with heap windows
         // (`Options::heap_windows`) its accesses go to ResourceDescriptorHeap[MEM_HEAP_BASE + w],
         // so every window slot is a raw view of `mem` (no textures here to share the heap with).
+        let win_count = crate::gpu::uma::MAX_HEAP_WINDOWS;
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: super::MEM_HEAP_NULL + 1,
+                NumDescriptors: super::MEM_HEAP_BASE + win_count as u32,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
             .map_err(e)?;
         let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
-        for k in 0..4usize {
+        for k in 0..win_count {
             let mut h = dh.GetCPUDescriptorHandleForHeapStart();
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
             dev.CreateUnorderedAccessView(&mem_buf, None::<&ID3D12Resource>, Some(&raw_window_uav(mem_bytes)), h);
         }
-        set_null_window_view(dev, dh.GetCPUDescriptorHandleForHeapStart(), inc);
         list.SetDescriptorHeaps(&[Some(dh.clone()), Some(bound._heaps[1].clone())]);
         list.SetComputeRootSignature(rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());

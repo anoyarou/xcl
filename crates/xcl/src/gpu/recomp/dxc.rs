@@ -258,6 +258,23 @@ mod version_tests {
         assert_eq!(lib(0, 0, "10.0.1.2").to_string(), "(file 10.0.1.2)");
     }
 
+    #[test]
+    fn a_source_compiled_at_o0_has_no_debug_noops() {
+        if location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let src = "RWByteAddressBuffer m : register(u0);\n[numthreads(1, 1, 1)] void main() { uint a = m.Load(0); uint b = a + 1u; m.Store(4, b); }\n";
+        let padded = format!("{src}{}", " ".repeat(8 * 1024 * 1024));
+        let with_noops = compile(src, "main", "cs_6_6", &["-O0"]).unwrap();
+        let without = compile(src, "main", "cs_6_6", &["-O0", "-opt-disable", "debug-nops"]).unwrap();
+        if without.len() == with_noops.len() {
+            println!("this DXC has no debug-nops switch");
+            return;
+        }
+        assert_eq!(compile(&padded, "main", "cs_6_6", &[]).unwrap().len(), without.len());
+    }
+
     /// The DXC of this PC, when it has one: what `report.json` says of it.
     #[test]
     fn the_loaded_dxc_is_identified() {
@@ -477,37 +494,9 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
-/// HLSL over this size is compiled at -O0 and one at a time (`compile_here`).
-const ENORMOUS_SOURCE: usize = 8 * 1024 * 1024;
-static ENORMOUS_ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// A compile's turn among enormous sources (`compile_here`): held for the whole DXC call.
-struct EnormousTurn(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-
-impl EnormousTurn {
-    fn wanted(src: &str) -> bool {
-        #[cfg(test)]
-        if src.contains(enormous_tests::MARK) {
-            return true;
-        }
-        src.len() > ENORMOUS_SOURCE
-    }
-
-    fn take() -> EnormousTurn {
-        let guard = ENORMOUS_ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-        #[cfg(test)]
-        enormous_tests::entered();
-        EnormousTurn(guard)
-    }
-}
-
-#[cfg(test)]
-impl Drop for EnormousTurn {
-    fn drop(&mut self) {
-        // before the field: the next compile can only start once this one is counted out
-        enormous_tests::left();
-    }
-}
+/// HLSL longer than this is compiled at -O0 (`compile_here`): a console compute program this big
+/// takes the direct DXIL translator instead (`pso::compile_console_shader`).
+pub const UNOPTIMISED_ABOVE: usize = 8 * 1024 * 1024;
 
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
@@ -519,14 +508,9 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // compile). -O0 only as a safety net for enormous sources.
     // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
     // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
-    // Enormous sources (over ENORMOUS_SOURCE, a handful in a retail pack) one at a time: each takes
-    // GBs in DXC, and the commit checks that hold compiles back (`wait_for_memory`) do not see that
-    // under Wine, where the commit limit includes all of the host's swap. Three of them at once
-    // took 29 GB of RAM and 20 GB of swap in `xcl pipelines` on a 32 GB machine.
-    let _enormous = EnormousTurn::wanted(src).then(EnormousTurn::take);
     if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > ENORMOUS_SOURCE {
-            args.push(crate::util::wide("-O0"));
+        if src.len() > UNOPTIMISED_ABOVE {
+            args.extend(["-O0", "-opt-disable", "debug-nops"].map(crate::util::wide));
         } else if src.len() > 1024 * 1024 {
             args.push(crate::util::wide("-O1"));
         }
@@ -763,72 +747,43 @@ fn cached_file(file: &Path) -> Option<Vec<u8>> {
 
 /// Cheap validation before handing a cached blob to D3D12. DXIL uses the DXBC
 /// container header: magic, hash, version, total size, chunk count and offsets.
-fn validate_dxil_container(blob: &[u8]) -> Result<(), String> {
+pub(super) fn valid_dxil_container(blob: &[u8]) -> bool {
     let rd = |at: usize| {
         blob.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
     };
-    if blob.len() < 36 {
-        return Err(format!("len {} < 36", blob.len()));
+    if blob.len() < 36 || blob.get(..4) != Some(b"DXBC") || rd(20) != Some(1) || rd(24) != Some(blob.len()) {
+        return false;
     }
-    if blob.get(..4) != Some(b"DXBC") {
-        return Err(format!("magic {:?} != DXBC", blob.get(..4)));
-    }
-    if rd(20) != Some(1) {
-        return Err(format!("version {:?} != 1", rd(20)));
-    }
-    if rd(24) != Some(blob.len()) {
-        return Err(format!("size header {:?} != blob len {}", rd(24), blob.len()));
-    }
-    let Some(count) = rd(28) else {
-        return Err("cannot read count".into());
-    };
+    let Some(count) = rd(28) else { return false };
     if count == 0 || count > 64 {
-        return Err(format!("count {count} not in 1..=64"));
+        return false;
     }
-    let Some(table_end) = 32usize.checked_add(count * 4) else {
-        return Err("table_end overflow".into());
-    };
+    let Some(table_end) = 32usize.checked_add(count * 4) else { return false };
     if table_end > blob.len() {
-        return Err(format!("table_end {table_end} > blob len {}", blob.len()));
+        return false;
     }
     let mut ranges = Vec::with_capacity(count);
     let mut has_dxil = false;
     for i in 0..count {
-        let Some(off) = rd(32 + i * 4) else {
-            return Err(format!("chunk {i} cannot read offset"));
-        };
-        if off < table_end {
-            return Err(format!("chunk {i} offset {off} < table_end {table_end}"));
+        let Some(off) = rd(32 + i * 4) else { return false };
+        if off < table_end || off & 3 != 0 {
+            return false;
         }
-        let Some(size) = rd(off + 4) else {
-            return Err(format!("chunk {i} cannot read size"));
-        };
-        let Some(end) = off.checked_add(8).and_then(|v| v.checked_add(size)) else {
-            return Err(format!("chunk {i} offset+size overflow"));
-        };
-        if end > blob.len() {
-            return Err(format!("chunk {i} end {end} > blob len {}", blob.len()));
-        }
-        if ranges.iter().any(|&(a, b)| off < b && a < end) {
-            return Err(format!("chunk {i} [{off}..{end}) overlaps existing chunk"));
+        let Some(size) = rd(off + 4) else { return false };
+        let Some(end) = off.checked_add(8).and_then(|v| v.checked_add(size)) else { return false };
+        if end > blob.len() || ranges.iter().any(|&(a, b)| off < b && a < end) {
+            return false;
         }
         if blob.get(off..off + 4) == Some(b"DXIL") {
             // DxilProgramHeader is six dwords before the bitcode payload.
             if size < 24 || blob.get(off + 16..off + 20) != Some(b"DXIL") {
-                return Err(format!("chunk {i} DXIL size {size} or magic {:?} invalid", blob.get(off + 16..off + 20)));
+                return false;
             }
             has_dxil = true;
         }
         ranges.push((off, end));
     }
-    if !has_dxil {
-        return Err("no DXIL chunk found".into());
-    }
-    Ok(())
-}
-
-fn valid_dxil_container(blob: &[u8]) -> bool {
-    validate_dxil_container(blob).is_ok()
+    has_dxil
 }
 
 fn compile_cached_in_with<F>(dir: &Path, src: &str, entry: &str, profile: &str, compile_one: F) -> Result<(Vec<u8>, bool), String>
@@ -882,19 +837,11 @@ where
         let _active = Compiling::start();
         compile_one()
     }
-    .and_then(|mut b| {
-        let rd = |at: usize| {
-            b.get(at..at + 4).map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
-        };
-        if let Some(hdr_size) = rd(24) {
-            if b.len() > hdr_size && hdr_size >= 32 && b.get(..4) == Some(b"DXBC") {
-                b.truncate(hdr_size);
-            }
-        }
-        if let Err(e) = validate_dxil_container(&b) {
-            Err(format!("DXIL cache: compiler returned an invalid DXIL container ({e})"))
-        } else {
+    .and_then(|b| {
+        if valid_dxil_container(&b) {
             Ok(b)
+        } else {
+            Err("DXIL cache: compiler returned an invalid DXIL container".into())
         }
     })
     .map_err(|e| {
@@ -1321,54 +1268,5 @@ mod cache_tests {
             release_tx.send(()).unwrap();
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
-    }
-}
-
-#[cfg(test)]
-mod enormous_tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// In test builds a source with this comment counts as enormous (`EnormousTurn::wanted`), so the
-    /// test needs no 8 MB shader.
-    pub(super) const MARK: &str = "// xcl-test: enormous source";
-    static INSIDE: AtomicUsize = AtomicUsize::new(0);
-    static MOST_INSIDE: AtomicUsize = AtomicUsize::new(0);
-
-    pub(super) fn entered() {
-        let n = INSIDE.fetch_add(1, Ordering::SeqCst) + 1;
-        MOST_INSIDE.fetch_max(n, Ordering::SeqCst);
-    }
-
-    pub(super) fn left() {
-        INSIDE.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    /// Enormous sources compiled from several threads at once go through DXC one at a time.
-    #[test]
-    fn enormous_sources_compile_one_at_a_time() {
-        if compiler().is_err() {
-            crate::gpu::recomp::runner::skip_test("no DXC");
-            return;
-        }
-        let threads: Vec<_> = (0..4u32)
-            .map(|i| {
-                std::thread::spawn(move || {
-                    // distinct sources, each with a little work for DXC
-                    let mut src = format!("{MARK}\nRWByteAddressBuffer o : register(u0);\n[numthreads(64, 1, 1)]\nvoid main(uint3 t : SV_DispatchThreadID) {{\n    uint v = t.x * {};\n", i + 3);
-                    for k in 0..200 {
-                        src.push_str(&format!("    v = (v ^ {k}u) * 2654435761u + (v >> {});\n", k % 31 + 1));
-                    }
-                    src.push_str("    o.Store(t.x * 4, v);\n}\n");
-                    compile_here(&src, "main", "cs_6_6", &[]).map(|d| d.len())
-                })
-            })
-            .collect();
-        for t in threads {
-            let dxil = t.join().unwrap().expect("the test shader compiles");
-            assert!(dxil > 0);
-        }
-        assert_eq!(INSIDE.load(Ordering::SeqCst), 0);
-        assert_eq!(MOST_INSIDE.load(Ordering::SeqCst), 1, "two enormous sources were in DXC at once");
     }
 }

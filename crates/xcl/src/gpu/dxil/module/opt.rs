@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use super::{BinOp, CastOp, ConstDef, FnAttrs, Module, Op, Pred, Ty, TypeDef, Value};
+use super::{BinOp, Block, CastOp, FnAttrs, Module, Op, Pred, Ty, Value};
 
 impl Op {
     /// Calls `f` on every value operand.
@@ -105,108 +105,10 @@ impl Module {
         }
     }
 
-    fn zext_src(&self, v: Value) -> Option<(Value, u32)> {
-        let Value::Inst(j) = v else { return None };
-        let Op::Cast(CastOp::ZExt, inner, _) = self.insts[j as usize].op else { return None };
-        self.int_width(self.value_ty(inner)).map(|sw| (inner, sw))
-    }
-
-    /// Reinterprets `v` as `to` for free: inverse `BitCast`, dominating `BitCast` in CSE,
-    /// or finite constant bitcast (excluding NaN and Inf in both directions).
-    fn free_bitcast(&mut self, v: Value, to: Ty, table: &HashMap<(Op, Ty), Value>) -> Option<Value> {
-        let from = self.value_ty(v);
-        if self.types[from.0 as usize] == TypeDef::Double || self.types[to.0 as usize] == TypeDef::Double {
-            return None;
-        }
-        if let Value::Inst(j) = v {
-            if let Op::Cast(CastOp::BitCast, inner, _) = self.insts[j as usize].op {
-                if self.value_ty(inner) == to {
-                    return Some(inner);
-                }
-            }
-        }
-        if let Some(&hit) = table.get(&(Op::Cast(CastOp::BitCast, v, to), to)) {
-            return Some(hit);
-        }
-        let fbits = |v| match v {
-            Value::Const(c) => match &self.consts[c as usize] {
-                ConstDef::Float(_, b) => Some(*b),
-                ConstDef::Null(t) if self.is_float(*t) => Some(0),
-                _ => None,
-            },
-            _ => None,
-        };
-        match (&self.types[from.0 as usize], &self.types[to.0 as usize]) {
-            (TypeDef::Int(32), TypeDef::Float) => self.const_u64(v).filter(|&b| (b as u32 & 0x7FFF_FFFF) < 0x7F80_0000).map(|b| self.const_float(to, b & 0xFFFF_FFFF)),
-            (TypeDef::Float, TypeDef::Int(32)) => fbits(v).filter(|&b| (b as u32 & 0x7FFF_FFFF) < 0x7F80_0000).map(|b| self.const_int(to, b & 0xFFFF_FFFF)),
-            (TypeDef::Int(16), TypeDef::Half) => self.const_u64(v).filter(|&b| (b as u16 & 0x7FFF) < 0x7C00).map(|b| self.const_float(to, b & 0xFFFF)),
-            (TypeDef::Half, TypeDef::Int(16)) => fbits(v).filter(|&b| (b as u16 & 0x7FFF) < 0x7C00).map(|b| self.const_int(to, b & 0xFFFF)),
-            _ => None,
-        }
-    }
-
-    /// Pushes `bitcast(select(c, a, b), to)` into `select` in place when `select` has no
-    /// non-bitcast uses (so the original select dies in DCE) and both arms convert for free,
-    /// returning the original `(op, ty)` so CSE can still reuse the bitcast key in dominated blocks.
-    fn simplify_bitcast_select(&mut self, op: &mut Op, repl: &mut [Option<Value>], table: &HashMap<(Op, Ty), Value>, bc_only: &[Option<Option<Ty>>]) -> Option<(Op, Ty)> {
-        let Op::Cast(CastOp::BitCast, Value::Inst(j), to) = *op else { return None };
-        if bc_only[j as usize] != Some(Some(to)) {
-            return None;
-        }
-        let Op::Select(c, t, f) = self.insts[j as usize].op else { return None };
-        let nt = self.free_bitcast(resolve(repl, t), to, table)?;
-        let nf = self.free_bitcast(resolve(repl, f), to, table)?;
-        let orig = (op.clone(), to);
-        *op = Op::Select(resolve(repl, c), resolve(repl, nt), resolve(repl, nf));
-        Some(orig)
-    }
-
-    /// Collapses nested same-condition selects (`select(c, t, select(c, _, f)) -> select(c, t, f)`).
-    fn simplify_select(&self, op: &mut Op, ty: Ty, repl: &mut [Option<Value>]) {
-        let Op::Select(c, t, f) = op else { return };
-        if self.types[ty.0 as usize] == TypeDef::Double {
-            return;
-        }
-        if let Value::Inst(j) = *f {
-            if let Op::Select(c2, _, f2) = self.insts[j as usize].op {
-                if resolve(repl, c2) == *c {
-                    *f = resolve(repl, f2);
-                }
-            }
-        }
-        if let Value::Inst(j) = *t {
-            if let Op::Select(c2, t2, _) = self.insts[j as usize].op {
-                if resolve(repl, c2) == *c {
-                    *t = resolve(repl, t2);
-                }
-            }
-        }
-    }
-
-    /// Canonicalizes operand order on commutative integer ops and integer compares for CSE.
-    fn canonicalize_commutative(&self, op: &mut Op, ty: Ty) {
-        match op {
-            Op::Bin(BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor, a, b, _)
-                if self.int_width(ty).is_some() && *b < *a => std::mem::swap(a, b),
-            Op::Cmp(p, a, b) if self.int_width(self.value_ty(*a)).is_some() && *b < *a => {
-                *p = match *p {
-                    Pred::Eq => Pred::Eq, Pred::Ne => Pred::Ne,
-                    Pred::UGt => Pred::ULt, Pred::ULt => Pred::UGt,
-                    Pred::UGe => Pred::ULe, Pred::ULe => Pred::UGe,
-                    Pred::SGt => Pred::SLt, Pred::SLt => Pred::SGt,
-                    Pred::SGe => Pred::SLe, Pred::SLe => Pred::SGe,
-                    _ => return,
-                };
-                std::mem::swap(a, b);
-            }
-            _ => {}
-        }
-    }
-
     /// Cheap algebraic & constant simplification on already-resolved operands.
-    fn simplify_op(&mut self, op: &Op, ty: Ty, table: &HashMap<(Op, Ty), Value>) -> Option<Value> {
-        // Keep f64 instructions intact so Doubles / DoubleExtensions shader flags stay consistent.
-        if matches!(self.types[ty.0 as usize], TypeDef::Double) {
+    fn simplify_op(&mut self, op: &Op, ty: Ty) -> Option<Value> {
+        // Keep 64-bit instructions intact so Int64Ops / Doubles shader flags stay consistent.
+        if matches!(self.types[ty.0 as usize], super::TypeDef::Int(64) | super::TypeDef::Double) {
             return None;
         }
         match *op {
@@ -217,19 +119,18 @@ impl Module {
                 match self.const_u64(c) {
                     Some(1) => Some(t),
                     Some(0) => Some(f),
-                    _ => (self.int_width(ty) == Some(1) && self.const_u64(t) == Some(1) && self.const_u64(f) == Some(0))
-                        .then_some(c),
+                    _ => None,
                 }
             }
             Op::Bin(bop, a, b, 0) => {
                 let w = self.int_width(ty)?;
-                if w > 64 {
+                // avoid dropping 64-bit ops that keep Int64Ops shader flags consistent
+                if w > 32 {
                     return None;
                 }
-                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                let mask = (1u64 << w) - 1;
                 let (ca, cb) = (self.const_u64(a), self.const_u64(b));
                 if let (Some(x), Some(y)) = (ca, cb) {
-                    let sx = if w >= 64 { x as i64 } else { ((x << (64 - w)) as i64) >> (64 - w) };
                     let r = match bop {
                         BinOp::Add => Some(x.wrapping_add(y)),
                         BinOp::Sub => Some(x.wrapping_sub(y)),
@@ -239,7 +140,7 @@ impl Module {
                         BinOp::Xor => Some(x ^ y),
                         BinOp::Shl if y < w as u64 => Some(x << y),
                         BinOp::LShr if y < w as u64 => Some(x >> y),
-                        BinOp::AShr if y < w as u64 => Some((sx >> (y as u32)) as u64),
+                        BinOp::AShr if y < w as u64 => Some((((x << (64 - w)) as i64) >> (64 - w + y as u32)) as u64),
                         BinOp::UDiv if y != 0 => Some(x / y),
                         BinOp::URem if y != 0 => Some(x % y),
                         _ => None,
@@ -251,7 +152,6 @@ impl Module {
                 match (bop, cb) {
                     (BinOp::Add | BinOp::Sub | BinOp::Or | BinOp::Xor | BinOp::Shl | BinOp::LShr | BinOp::AShr, Some(0)) => return Some(a),
                     (BinOp::And, Some(m)) if m == mask => return Some(a),
-                    (BinOp::Or, Some(m)) if m == mask => return Some(b),
                     (BinOp::And | BinOp::Mul, Some(0)) => return Some(b),
                     (BinOp::Mul, Some(1)) => return Some(a),
                     _ => {}
@@ -259,8 +159,7 @@ impl Module {
                 match (bop, ca) {
                     (BinOp::Add | BinOp::Or | BinOp::Xor, Some(0)) => return Some(b),
                     (BinOp::And, Some(m)) if m == mask => return Some(b),
-                    (BinOp::Or, Some(m)) if m == mask => return Some(a),
-                    (BinOp::And | BinOp::Mul | BinOp::Shl | BinOp::LShr | BinOp::AShr, Some(0)) => return Some(a),
+                    (BinOp::And | BinOp::Mul | BinOp::Shl | BinOp::LShr, Some(0)) => return Some(a),
                     (BinOp::Mul, Some(1)) => return Some(b),
                     _ => {}
                 }
@@ -271,41 +170,16 @@ impl Module {
                         _ => {}
                     }
                 }
-                if bop == BinOp::LShr {
-                    if let Some(sh) = cb.filter(|&sh| sh < w as u64) {
-                        if self.zext_src(a).is_some_and(|(_, sw)| sh >= sw as u64) {
-                            return Some(self.const_int(ty, 0));
-                        }
-                        if let Value::Inst(j) = a {
-                            if let Op::Bin(BinOp::Or, x, y, 0) = self.insts[j as usize].op {
-                                for (lo, hi) in [(x, y), (y, x)] {
-                                    let lo_cleared = self.const_u64(lo) == Some(0)
-                                        || self.zext_src(lo).is_some_and(|(_, sw)| sh >= sw as u64);
-                                    if let (true, Value::Inst(hj)) = (lo_cleared, hi) {
-                                        if let Op::Bin(BinOp::Shl, z, k, 0) = self.insts[hj as usize].op {
-                                            if self.const_u64(k) == Some(sh)
-                                                && self.zext_src(z).is_some_and(|(_, sw)| (sw as u64) + sh <= w as u64)
-                                            {
-                                                return Some(z);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
                 None
             }
             Op::Cmp(p, a, b) => {
                 let at = self.value_ty(a);
                 let w = self.int_width(at)?;
-                if w > 64 {
+                if w > 32 {
                     return None;
                 }
-                let (ca, cb) = (self.const_u64(a), self.const_u64(b));
-                if let (Some(x), Some(y)) = (ca, cb) {
-                    let sx = |v: u64| if w >= 64 { v as i64 } else { ((v << (64 - w)) as i64) >> (64 - w) };
+                if let (Some(x), Some(y)) = (self.const_u64(a), self.const_u64(b)) {
+                    let sx = |v: u64| ((v << (64 - w)) as i64) >> (64 - w);
                     let r = match p {
                         Pred::Eq => Some(x == y),
                         Pred::Ne => Some(x != y),
@@ -333,53 +207,29 @@ impl Module {
                         return Some(self.const_int(ty, r as u64));
                     }
                 }
-                if w == 1 {
-                    if matches!((p, cb), (Pred::Eq, Some(1)) | (Pred::Ne, Some(0))) {
-                        return Some(a);
-                    }
-                    if matches!((p, ca), (Pred::Eq, Some(1)) | (Pred::Ne, Some(0))) {
-                        return Some(b);
-                    }
+                None
+            }
+            Op::Cast(CastOp::BitCast, Value::Inst(j), to) => {
+                if matches!(self.types[self.insts[j as usize].ty.0 as usize], super::TypeDef::Int(64) | super::TypeDef::Double) {
+                    return None;
                 }
-                if let Some((inner, 1)) = self.zext_src(a) {
-                    if matches!((p, cb), (Pred::Ne | Pred::UGt, Some(0)) | (Pred::Eq, Some(1))) {
-                        return Some(inner);
-                    }
-                }
-                if let Some((inner, 1)) = self.zext_src(b) {
-                    if matches!((p, ca), (Pred::Ne | Pred::ULt, Some(0)) | (Pred::Eq, Some(1))) {
+                if let Op::Cast(CastOp::BitCast, inner, _) = self.insts[j as usize].op {
+                    if self.value_ty(inner) == to {
                         return Some(inner);
                     }
                 }
                 None
             }
-            Op::Cast(CastOp::BitCast, v, to) => self.free_bitcast(v, to, table),
             Op::Cast(cop @ (CastOp::ZExt | CastOp::SExt | CastOp::Trunc), v, to) => {
                 let sw = self.int_width(self.value_ty(v))?;
                 let dw = self.int_width(to)?;
-                if sw > 64 || dw > 64 {
+                if sw > 32 || dw > 32 {
                     return None;
                 }
-                if sw == dw {
-                    return Some(v);
-                }
-                if cop == CastOp::Trunc {
-                    if let Value::Inst(j) = v {
-                        if let Op::Cast(CastOp::ZExt | CastOp::SExt, inner, _) = self.insts[j as usize].op {
-                            if self.value_ty(inner) == to {
-                                return Some(inner);
-                            }
-                        }
-                    }
-                }
                 let x = self.const_u64(v)?;
-                let dm = if dw >= 64 { u64::MAX } else { (1u64 << dw) - 1 };
                 let r = match cop {
-                    CastOp::ZExt | CastOp::Trunc => x & dm,
-                    CastOp::SExt => {
-                        let sx = if sw >= 64 { x as i64 } else { ((x << (64 - sw)) as i64) >> (64 - sw) };
-                        (sx as u64) & dm
-                    }
+                    CastOp::ZExt | CastOp::Trunc => x & ((1u64 << dw) - 1),
+                    CastOp::SExt => ((((x << (64 - sw)) as i64) >> (64 - sw)) as u64) & ((1u64 << dw) - 1),
                     _ => unreachable!(),
                 };
                 Some(self.const_int(to, r))
@@ -388,8 +238,8 @@ impl Module {
         }
     }
 
-    /// Whether an unused instruction can go. Double values stay: helpers already set
-    /// the Doubles / DoubleExtensions flags for them (`Int64Ops` is refreshed in `infer_type_features`).
+    /// Whether an unused instruction can go. 64-bit values stay: helpers already set
+    /// the Int64Ops / Doubles / DoubleExtensions flags for them.
     fn removable(&self, op: &Op, ty: Ty, wide: &[Ty]) -> bool {
         if wide.contains(&ty) {
             return false;
@@ -407,15 +257,9 @@ impl Module {
                 let d = &self.funcs[*f as usize];
                 matches!(d.attrs, FnAttrs::ReadNone | FnAttrs::ReadOnly)
                     && !d.name.ends_with(".f64")
-                    && [
-                        "dx.op.unary.", "dx.op.unaryBits.", "dx.op.binary.", "dx.op.tertiary.", "dx.op.quaternary.",
-                        "dx.op.dot", "dx.op.legacyF16ToF32", "dx.op.legacyF32ToF16", "dx.op.bitcast",
-                        "dx.op.isSpecialFloat.", "dx.op.threadId", "dx.op.groupId.", "dx.op.flattenedThreadIdInGroup.",
-                        "dx.op.loadInput.", "dx.op.annotateHandle", "dx.op.createHandleFromBinding",
-                        "dx.op.cbufferLoadLegacy.",
-                    ]
-                    .iter()
-                    .any(|p| d.name.starts_with(p))
+                    && ["dx.op.unary.", "dx.op.binary.", "dx.op.tertiary.", "dx.op.loadInput.", "dx.op.annotateHandle", "dx.op.createHandleFromBinding", "dx.op.cbufferLoadLegacy."]
+                        .iter()
+                        .any(|p| d.name.starts_with(p))
             }
             _ => false,
         }
@@ -503,7 +347,7 @@ impl Module {
     /// Cleans up the entry function (see the module docs of `opt`). Values
     /// keep their identities; replaced ones simply lose their uses.
     ///
-    /// `XCL_DXIL_NO_OPT=phi,fold,cse,dce` (any subset, or `all`) skips passes, for bisecting.
+    /// `XCL_DXIL_NO_OPT=phi,cse,dce,merge` (any subset, or `all`) skips passes, for bisecting.
     pub fn optimize(&mut self) {
         let off = std::env::var("XCL_DXIL_NO_OPT").unwrap_or_default();
         let skip = |p: &str| off.split(',').any(|x| x.trim() == p || x.trim() == "all");
@@ -584,42 +428,7 @@ impl Module {
             Enter(usize),
             Leave(usize),
         }
-        let (do_fold, do_cse) = (!skip("fold"), !skip("cse"));
-        // None = unseen, Some(Some(to)) = only used by BitCast(_, to), Some(None) = other use.
-        let mut bc_only: Vec<Option<Option<Ty>>> = vec![None; if do_fold { self.insts.len() } else { 0 }];
-        if do_fold {
-            for &b in &order {
-                for &u in &self.blocks[b as usize] {
-                    if repl[u as usize].is_some() {
-                        continue;
-                    }
-                    match self.insts[u as usize].op {
-                        Op::Cast(CastOp::BitCast, v, to) => if let Value::Inst(j) = resolve(&mut repl, v) {
-                            bc_only[j as usize] = match bc_only[j as usize] {
-                                None => Some(Some(to)),
-                                Some(Some(prev)) if prev == to => Some(Some(to)),
-                                _ => Some(None),
-                            };
-                        },
-                        Op::Select(c, t, f) if self.types[self.insts[u as usize].ty.0 as usize] != TypeDef::Double => {
-                            let rc = resolve(&mut repl, c);
-                            if let Value::Inst(j) = rc { bc_only[j as usize] = Some(None); }
-                            for arm in [t, f] {
-                                if let Value::Inst(j) = resolve(&mut repl, arm) {
-                                    if !matches!(self.insts[j as usize].op, Op::Select(c2, _, _) if resolve(&mut repl, c2) == rc) {
-                                        bc_only[j as usize] = Some(None);
-                                    }
-                                }
-                            }
-                        }
-                        _ => self.insts[u as usize].op.for_each_operand(|v| {
-                            if let Value::Inst(j) = resolve(&mut repl, v) { bc_only[j as usize] = Some(None); }
-                        }),
-                    }
-                }
-            }
-        }
-        let mut stack = if !do_fold && !do_cse { Vec::new() } else { vec![Step::Enter(0)] };
+        let mut stack = if skip("cse") { Vec::new() } else { vec![Step::Enter(0)] };
         let mut cse_replaced = false;
         while let Some(step) = stack.pop() {
             let b = match step {
@@ -639,26 +448,16 @@ impl Module {
             let mut local: HashMap<(Op, Ty), Value> = HashMap::new();
             for k in 0..self.blocks[b].len() {
                 let i = self.blocks[b][k] as usize;
-                let ty = self.insts[i].ty;
                 let mut op = std::mem::replace(&mut self.insts[i].op, Op::Ret);
                 op.map_operands(|v| resolve(&mut repl, v));
                 if repl[i].is_none() {
-                    let alias_key = if do_fold {
-                        let k = self.simplify_bitcast_select(&mut op, &mut repl, &table, &bc_only);
-                        self.simplify_select(&mut op, ty, &mut repl);
-                        if let Some(s) = self.simplify_op(&op, ty, &table) {
-                            repl[i] = Some(resolve(&mut repl, s));
-                            cse_replaced = true;
-                        }
-                        k
+                    if let Some(s) = self.simplify_op(&op, self.insts[i].ty) {
+                        repl[i] = Some(s);
+                        cse_replaced = true;
                     } else {
-                        None
-                    };
-                    if repl[i].is_none() && do_cse {
-                        self.canonicalize_commutative(&mut op, ty);
                         let kind = self.cse_kind(&op);
                         if kind != Cse::No {
-                            let key = (op.clone(), ty);
+                            let key = (op.clone(), self.insts[i].ty);
                             let t = if kind == Cse::Dom { &mut table } else { &mut local };
                             if let Some(&v) = t.get(&key) {
                                 repl[i] = Some(v);
@@ -674,10 +473,6 @@ impl Module {
                             // set for subsequent wave/quad intrinsics in the same basic block.
                             local.clear();
                         }
-                    }
-                    if let (true, Some(akey)) = (do_cse, alias_key) {
-                        let old = table.insert(akey.clone(), repl[i].unwrap_or(Value::Inst(i as u32)));
-                        undo.push((akey, old));
                     }
                 }
                 self.insts[i].op = op;
@@ -731,8 +526,8 @@ impl Module {
         }
 
         // dead instructions: live = side effects, terminators and their operands, transitively
-        let (_, f64t) = self.existing_i64_f64();
-        let wide: Vec<Ty> = f64t.into_iter().collect();
+        let (i64t, f64t) = self.existing_i64_f64();
+        let wide: Vec<Ty> = i64t.into_iter().chain(f64t).collect();
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
         for &b in &order {
@@ -755,6 +550,372 @@ impl Module {
         }
         for b in &mut self.blocks {
             b.retain(|&i| live[i as usize]);
+        }
+
+        if !skip("merge") && self.simplify_cfg() {
+            let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
+            let mut repl2: Vec<Option<Value>> = vec![None; self.insts.len()];
+            let mut phi_changed = false;
+            while !skip("phi") {
+                let mut changed = false;
+                for &b in &order {
+                    for &i in &self.blocks[b as usize] {
+                        let i = i as usize;
+                        if repl2[i].is_some() {
+                            continue;
+                        }
+                        let Op::Phi(inc) = &self.insts[i].op else { break };
+                        let me = Value::Inst(i as u32);
+                        let mut same: Option<Value> = None;
+                        let mut trivial = true;
+                        for &(v, _) in inc {
+                            let v = resolve(&mut repl2, v);
+                            if v == me || Some(v) == same {
+                                continue;
+                            }
+                            if same.is_some() {
+                                trivial = false;
+                                break;
+                            }
+                            same = Some(v);
+                        }
+                        if let (true, Some(v)) = (trivial, same) {
+                            repl2[i] = Some(v);
+                            changed = true;
+                            phi_changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            if phi_changed {
+                for &b in &order {
+                    for k in 0..self.blocks[b as usize].len() {
+                        let i = self.blocks[b as usize][k] as usize;
+                        self.insts[i].op.map_operands(|v| resolve(&mut repl2, v));
+                    }
+                }
+            }
+            if !skip("dce") {
+                live.fill(false);
+                work.clear();
+                for &b in &order {
+                    for &i in &self.blocks[b as usize] {
+                        if repl2[i as usize].is_none() && !self.removable(&self.insts[i as usize].op, self.insts[i as usize].ty, &wide) {
+                            live[i as usize] = true;
+                            work.push(i);
+                        }
+                    }
+                }
+                while let Some(i) = work.pop() {
+                    self.insts[i as usize].op.for_each_operand(|v| {
+                        if let Value::Inst(j) = v {
+                            if !live[j as usize] {
+                                live[j as usize] = true;
+                                work.push(j);
+                            }
+                        }
+                    });
+                }
+                for b in &mut self.blocks {
+                    b.retain(|&i| live[i as usize]);
+                }
+            }
+            debug_assert!(self.uses_well_formed(&order));
+        }
+    }
+
+    /// Simplifies the CFG to a fixed point:
+    /// 1. Collapses degenerate `CondBr(_, t, t)` and `Switch` cases matching the default target.
+    /// 2. Bypasses empty trampoline blocks (`[Br(t)]`) whenever `t`'s phis allow it.
+    /// 3. Merges single-predecessor blocks `a -> b` along unconditional branches.
+    fn simplify_cfg(&mut self) -> bool {
+        let mut ever_changed = false;
+        let mut phi_repl: Vec<Option<Value>> = Vec::new();
+        loop {
+            let mut changed = false;
+            let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
+
+            // Step 0: simplify degenerate terminators (`CondBr(_, t, t)`, `Switch` cases -> default).
+            for &b_u32 in &order {
+                let b = b_u32 as usize;
+                let Some(&term_i) = self.blocks[b].last() else { continue };
+                let b_blk = Block(b_u32);
+                match &mut self.insts[term_i as usize].op {
+                    Op::CondBr(_, t, f) if *t == *f => {
+                        let target = *t;
+                        self.insts[term_i as usize].op = Op::Br(target);
+                        self.drop_phi_edges(target.0 as usize, b_blk, 1);
+                        changed = true;
+                    }
+                    Op::Switch(_, def, cases) => {
+                        let def = *def;
+                        let before = cases.len();
+                        cases.retain(|&(_, target)| target != def);
+                        let dropped = before - cases.len();
+                        let became_empty = cases.is_empty();
+                        if dropped > 0 {
+                            self.drop_phi_edges(def.0 as usize, b_blk, dropped);
+                            changed = true;
+                        }
+                        if became_empty {
+                            self.insts[term_i as usize].op = Op::Br(def);
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Step 1: bypass empty trampoline blocks (`[Br(t)]`, `b != 0`, `t != b`).
+            // `preds[x]` is maintained as a superset of live blocks whose terminator targets `x`.
+            let mut preds: Vec<Vec<usize>> = vec![Vec::new(); self.blocks.len()];
+            for &b_u32 in &order {
+                let b = b_u32 as usize;
+                for s in self.successors(b) {
+                    let s = s.0 as usize;
+                    if !preds[s].contains(&b) {
+                        preds[s].push(b);
+                    }
+                }
+            }
+            for &b_u32 in &order {
+                let b = b_u32 as usize;
+                if b == 0 || self.blocks[b].len() != 1 {
+                    continue;
+                }
+                let Op::Br(t_blk) = self.insts[self.blocks[b][0] as usize].op else { continue };
+                let t = t_blk.0 as usize;
+                if t == b || self.blocks[t].is_empty() {
+                    continue;
+                }
+                let b_blk = Block(b_u32);
+                let cand_preds = preds[b].clone();
+                let target_has_phi = self.blocks[t]
+                    .first()
+                    .is_some_and(|&i| matches!(self.insts[i as usize].op, Op::Phi(_)));
+                if target_has_phi {
+                    // Bypassing a multi-edge trampoline into a phi block would duplicate phi
+                    // operands for every phi in `t`; only bypass when `b` has a single incoming edge.
+                    let total_edges: usize = cand_preds
+                        .iter()
+                        .filter(|&&p| p != b && !self.blocks[p].is_empty())
+                        .map(|&p| self.count_term_edges(p, b_blk))
+                        .sum();
+                    if total_edges > 1 {
+                        continue;
+                    }
+                }
+                let mut all_redirected = true;
+                let mut any_redirected = false;
+                for p in cand_preds {
+                    if p == b || self.blocks[p].is_empty() {
+                        continue;
+                    }
+                    let edges = self.count_term_edges(p, b_blk);
+                    if edges == 0 {
+                        continue;
+                    }
+                    let p_blk = Block(p as u32);
+                    if !self.phi_redirect_safe(t, b_blk, p_blk) {
+                        all_redirected = false;
+                        continue;
+                    }
+                    self.rewrite_term_target(p, b_blk, t_blk);
+                    self.add_redirected_phi_edges(t, b_blk, p_blk, edges);
+                    if !preds[t].contains(&p) {
+                        preds[t].push(p);
+                    }
+                    any_redirected = true;
+                    changed = true;
+                }
+                if any_redirected && all_redirected {
+                    self.blocks[b].clear();
+                    self.remove_all_phi_edges(t, b_blk);
+                }
+            }
+
+            // Step 2: merge single-predecessor linear blocks (`a -> b`).
+            let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
+            let mut pred_edges = vec![0u32; self.blocks.len()];
+            for &b_u32 in &order {
+                for s in self.successors(b_u32 as usize) {
+                    pred_edges[s.0 as usize] += 1;
+                }
+            }
+            let mut any_phi_repl = false;
+            for &a_u32 in &order {
+                let a = a_u32 as usize;
+                if self.blocks[a].is_empty() {
+                    continue;
+                }
+                let a_blk = Block(a_u32);
+                while let Some(&term_i) = self.blocks[a].last() {
+                    let Op::Br(b_blk) = self.insts[term_i as usize].op else { break };
+                    let b = b_blk.0 as usize;
+                    if b == 0 || b == a || self.blocks[b].is_empty() || pred_edges[b] != 1 {
+                        break;
+                    }
+                    // Verify every leading phi in `b` has an incoming value from `a` before mutating.
+                    let mut phis_ok = true;
+                    for &inst in &self.blocks[b] {
+                        let Op::Phi(inc) = &self.insts[inst as usize].op else { break };
+                        if !inc.iter().any(|&(_, bb)| bb == a_blk) {
+                            phis_ok = false;
+                            break;
+                        }
+                    }
+                    if !phis_ok {
+                        break;
+                    }
+                    // Pop `Br(b)` from `a` and move `b`'s non-phi instructions into `a`.
+                    self.blocks[a].pop();
+                    let b_insts = std::mem::take(&mut self.blocks[b]);
+                    for inst in b_insts {
+                        if let Op::Phi(inc) = &self.insts[inst as usize].op {
+                            let v = inc.iter().find(|&&(_, bb)| bb == a_blk).unwrap().0;
+                            if phi_repl.is_empty() {
+                                phi_repl.resize(self.insts.len(), None);
+                            }
+                            phi_repl[inst as usize] = Some(v);
+                            any_phi_repl = true;
+                        } else {
+                            self.def_block[inst as usize] = a_blk;
+                            self.blocks[a].push(inst);
+                        }
+                    }
+                    // Update successor phis from `b` to `a`.
+                    let mut seen_s = Vec::new();
+                    for s_blk in self.successors(a) {
+                        if seen_s.contains(&s_blk) {
+                            continue;
+                        }
+                        seen_s.push(s_blk);
+                        let s = s_blk.0 as usize;
+                        for k in 0..self.blocks[s].len() {
+                            let i = self.blocks[s][k] as usize;
+                            let Op::Phi(inc) = &mut self.insts[i].op else { break };
+                            for (_, bb) in inc.iter_mut() {
+                                if *bb == b_blk {
+                                    *bb = a_blk;
+                                }
+                            }
+                        }
+                    }
+                    pred_edges[b] = 0;
+                    changed = true;
+                }
+            }
+            if any_phi_repl {
+                let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
+                for &b_u32 in &order {
+                    let b = b_u32 as usize;
+                    for k in 0..self.blocks[b].len() {
+                        let i = self.blocks[b][k] as usize;
+                        self.insts[i].op.map_operands(|v| resolve(&mut phi_repl, v));
+                    }
+                }
+                phi_repl.fill(None);
+            }
+
+            if !changed {
+                break;
+            }
+            ever_changed = true;
+        }
+        ever_changed
+    }
+
+    fn count_term_edges(&self, b: usize, target: Block) -> usize {
+        let Some(&term_i) = self.blocks[b].last() else { return 0 };
+        match &self.insts[term_i as usize].op {
+            Op::Br(t) => usize::from(*t == target),
+            Op::CondBr(_, t, f) => usize::from(*t == target) + usize::from(*f == target),
+            Op::Switch(_, d, cases) => usize::from(*d == target) + cases.iter().filter(|&&(_, c)| c == target).count(),
+            _ => 0,
+        }
+    }
+
+    fn rewrite_term_target(&mut self, b: usize, from: Block, to: Block) {
+        let Some(&term_i) = self.blocks[b].last() else { return };
+        match &mut self.insts[term_i as usize].op {
+            Op::Br(t) => {
+                if *t == from {
+                    *t = to;
+                }
+            }
+            Op::CondBr(_, t, f) => {
+                if *t == from {
+                    *t = to;
+                }
+                if *f == from {
+                    *f = to;
+                }
+            }
+            Op::Switch(_, d, cases) => {
+                if *d == from {
+                    *d = to;
+                }
+                for (_, c) in cases.iter_mut() {
+                    if *c == from {
+                        *c = to;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn phi_redirect_safe(&self, target: usize, via: Block, pred: Block) -> bool {
+        for &i in &self.blocks[target] {
+            let Op::Phi(inc) = &self.insts[i as usize].op else { break };
+            let Some(&(v_via, _)) = inc.iter().find(|&&(_, bb)| bb == via) else {
+                return false;
+            };
+            if inc.iter().any(|&(v_p, bb)| bb == pred && v_p != v_via) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn add_redirected_phi_edges(&mut self, target: usize, via: Block, pred: Block, count: usize) {
+        for k in 0..self.blocks[target].len() {
+            let i = self.blocks[target][k] as usize;
+            let Op::Phi(inc) = &mut self.insts[i].op else { break };
+            let v_via = inc.iter().find(|&&(_, bb)| bb == via).unwrap().0;
+            for _ in 0..count {
+                inc.push((v_via, pred));
+            }
+        }
+    }
+
+    fn remove_all_phi_edges(&mut self, target: usize, from: Block) {
+        for k in 0..self.blocks[target].len() {
+            let i = self.blocks[target][k] as usize;
+            let Op::Phi(inc) = &mut self.insts[i].op else { break };
+            inc.retain(|&(_, bb)| bb != from);
+        }
+    }
+
+    fn drop_phi_edges(&mut self, target: usize, from: Block, count: usize) {
+        if count == 0 {
+            return;
+        }
+        for k in 0..self.blocks[target].len() {
+            let i = self.blocks[target][k] as usize;
+            let Op::Phi(inc) = &mut self.insts[i].op else { break };
+            let mut rem = count;
+            inc.retain(|&(_, bb)| {
+                if rem > 0 && bb == from {
+                    rem -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
         }
     }
 }
@@ -840,5 +1001,240 @@ mod tests {
                 "{op_name} must not be CSE-merged across dx.op.discard"
             );
         }
+    }
+
+    fn reachable_blocks(m: &Module) -> usize {
+        m.block_layout().0.len()
+    }
+
+    #[test]
+    fn simplify_cfg_collapses_trampoline_chain_and_merges_linear_blocks() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        let t1 = m.new_block();
+        let t2 = m.new_block();
+        let mid = m.new_block();
+        let exit = m.new_block();
+
+        let void = m.void();
+        let i32t = m.i32();
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        m.set_block(entry);
+        let c7 = m.i32c(7);
+        m.br(t1);
+
+        m.set_block(t1);
+        m.br(t2);
+
+        m.set_block(t2);
+        m.br(mid);
+
+        m.set_block(mid);
+        let p = m.phi(i32t);
+        m.add_incoming(p, c7, t2);
+        let c3 = m.i32c(3);
+        let sum = m.bin(BinOp::Add, p, c3);
+        m.br(exit);
+
+        m.set_block(exit);
+        m.call(sink, &[sum]);
+        m.ret();
+
+        m.optimize();
+        assert_eq!(reachable_blocks(&m), 1, "entire linear trampoline chain should collapse into entry");
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+        assert_eq!(count_calls(&m, sink), 1);
+    }
+
+    #[test]
+    fn simplify_cfg_preserves_phi_conflict_trampoline() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        let tramp = m.new_block();
+        let join = m.new_block();
+
+        let void = m.void();
+        let i32t = m.i32();
+        let src_ty = m.func_ty(i32t, &[]);
+        let src = m.declare("dx.op.waveGetLaneIndex", src_ty, FnAttrs::ReadNone);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        m.set_block(entry);
+        let lane = m.call(src, &[]);
+        let z = m.i32c(0);
+        let cond = m.cmp(Pred::Eq, lane, z);
+        let v1 = m.i32c(1);
+        let v2 = m.i32c(2);
+        m.cond_br(cond, tramp, join);
+
+        m.set_block(tramp);
+        m.br(join);
+
+        m.set_block(join);
+        let p = m.phi(i32t);
+        m.add_incoming(p, v1, entry);
+        m.add_incoming(p, v2, tramp);
+        m.call(sink, &[p]);
+        m.ret();
+
+        m.optimize();
+        // `tramp` cannot be bypassed because `entry` already feeds a different value into `join`'s phi.
+        assert_eq!(reachable_blocks(&m), 3);
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+    }
+
+    #[test]
+    fn simplify_cfg_collapses_same_target_cond_br_and_switch() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        let mid = m.new_block();
+        let exit = m.new_block();
+
+        let void = m.void();
+        let i32t = m.i32();
+        let src_ty = m.func_ty(i32t, &[]);
+        let src = m.declare("dx.op.waveGetLaneIndex", src_ty, FnAttrs::ReadNone);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        m.set_block(entry);
+        let lane = m.call(src, &[]);
+        let z = m.i32c(0);
+        let c1 = m.i32c(1);
+        let cond = m.cmp(Pred::Eq, lane, z);
+        let v = m.i32c(42);
+        m.cond_br(cond, mid, mid);
+
+        m.set_block(mid);
+        let p = m.phi(i32t);
+        m.add_incoming(p, v, entry);
+        m.add_incoming(p, v, entry);
+        m.switch(lane, exit, &[(z, exit), (c1, exit)]);
+
+        m.set_block(exit);
+        let p2 = m.phi(i32t);
+        m.add_incoming(p2, p, mid);
+        m.add_incoming(p2, p, mid);
+        m.add_incoming(p2, p, mid);
+        m.call(sink, &[p2]);
+        m.ret();
+
+        m.optimize();
+        assert_eq!(reachable_blocks(&m), 1, "degenerate CondBr and Switch should collapse and merge");
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+        assert_eq!(count_calls(&m, sink), 1);
+    }
+
+    #[test]
+    fn simplify_cfg_merges_loop_latch_and_rewrites_header_phi() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        let header = m.new_block();
+        let latch = m.new_block();
+        let exit = m.new_block();
+
+        let void = m.void();
+        let i32t = m.i32();
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        m.set_block(entry);
+        let z = m.i32c(0);
+        let one = m.i32c(1);
+        let limit = m.i32c(10);
+        m.br(header);
+
+        m.set_block(header);
+        let iv = m.phi(i32t);
+        m.add_incoming(iv, z, entry);
+        m.br(latch);
+
+        m.set_block(latch);
+        let next = m.bin(BinOp::Add, iv, one);
+        m.add_incoming(iv, next, latch);
+        let cont = m.cmp(Pred::ULt, next, limit);
+        m.cond_br(cont, header, exit);
+
+        m.set_block(exit);
+        m.call(sink, &[next]);
+        m.ret();
+
+        m.optimize();
+        // `latch` merges into `header`, leaving `entry`, `header` (self-loop), `exit`.
+        assert_eq!(reachable_blocks(&m), 3);
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+        // Header phi's backedge predecessor must now be `header` itself.
+        let Value::Inst(iv_i) = iv else { unreachable!() };
+        let Op::Phi(inc) = &m.insts[iv_i as usize].op else { panic!("expected phi") };
+        assert!(inc.iter().any(|&(_, b)| b == header), "header phi backedge should point to header after latch merge");
+        assert!(!inc.iter().any(|&(_, b)| b == latch), "merged latch must not remain in header phi");
+    }
+
+    #[test]
+    fn simplify_cfg_does_not_inflate_multi_pred_phi_trampoline() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        let left = m.new_block();
+        let right = m.new_block();
+        let other = m.new_block();
+        let tramp = m.new_block();
+        let join = m.new_block();
+
+        let void = m.void();
+        let i32t = m.i32();
+        let src_ty = m.func_ty(i32t, &[]);
+        let src = m.declare("dx.op.waveGetLaneIndex", src_ty, FnAttrs::ReadNone);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        m.set_block(entry);
+        let lane = m.call(src, &[]);
+        let c0 = m.i32c(0);
+        let c1 = m.i32c(1);
+        let v1 = m.i32c(11);
+        let v2 = m.i32c(22);
+        m.switch(lane, other, &[(c0, left), (c1, right)]);
+
+        m.set_block(left);
+        m.call(sink, &[c0]);
+        m.br(tramp);
+
+        m.set_block(right);
+        m.call(sink, &[c1]);
+        m.br(tramp);
+
+        m.set_block(other);
+        m.br(join);
+
+        m.set_block(tramp);
+        m.br(join);
+
+        m.set_block(join);
+        let p = m.phi(i32t);
+        m.add_incoming(p, v1, tramp);
+        m.add_incoming(p, v2, other);
+        m.call(sink, &[p]);
+        m.ret();
+
+        m.optimize();
+        // `other` (1 pred -> phi) IS bypassed into `entry -> join`, while `tramp` (2 preds -> phi) stays
+        // so `join`'s phi stays at 2 entries instead of growing to 3.
+        let Value::Inst(p_i) = p else { unreachable!() };
+        let Op::Phi(inc) = &m.insts[p_i as usize].op else { panic!("expected phi") };
+        assert_eq!(inc.len(), 2);
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
     }
 }

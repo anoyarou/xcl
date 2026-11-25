@@ -38,6 +38,12 @@ const INITIAL_SKIP_SAMPLES: usize = 64;
 const VLC_BITS: usize = 9;
 const SCALE_VLC_BITS: usize = 8;
 
+// The endpoints round to zero and positive infinity as f32. Exponents outside
+// this range round to the same values as the nearest endpoint.
+const QUANT_MIN_EXP: i32 = -904;
+const QUANT_MAX_EXP: i32 = 771;
+const QUANT_GAIN_COUNT: usize = (QUANT_MAX_EXP - QUANT_MIN_EXP + 1) as usize;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Version {
     Xma1,
@@ -549,6 +555,13 @@ struct StaticTables {
     vec1_vlc: VlcTable,
     windows: [Vec<f32>; BLOCK_SIZES],
     imdct: [ImdctPlan; BLOCK_SIZES],
+    quant_gains: [f32; QUANT_GAIN_COUNT],
+}
+
+impl StaticTables {
+    fn quant_gain(&self, exp: i32) -> f32 {
+        self.quant_gains[(exp.clamp(QUANT_MIN_EXP, QUANT_MAX_EXP) - QUANT_MIN_EXP) as usize]
+    }
 }
 
 fn static_tables() -> &'static StaticTables {
@@ -571,6 +584,10 @@ fn static_tables() -> &'static StaticTables {
             vec1_vlc: VlcTable::from_pairs(VLC_BITS, &VEC1_TABLE, 0),
             windows,
             imdct,
+            quant_gains: std::array::from_fn(|i| {
+                let exp = QUANT_MIN_EXP + i as i32;
+                10.0_f64.powf(exp as f64 / 20.0) as f32
+            }),
         }
     })
 }
@@ -1408,7 +1425,7 @@ impl StreamDecoder {
                     let end = self.sfb_offsets[self.table_idx][b + 1].min(self.subframe_len);
                     let sf = self.channel[c].saved_scale_factors[sf_buf][b];
                     let exp = q_step - (max_sf - sf) * sf_step;
-                    let quant = 10.0_f64.powf(exp as f64 / 20.0) as f32;
+                    let quant = st.quant_gain(exp);
                     for k in start..end {
                         self.tmp[k] = self.channel[c].out[base + k] * quant;
                     }
@@ -1565,13 +1582,12 @@ impl StreamDecoder {
 
             if num_bits_prev_frame > 0 {
                 let remaining_packet_bits = buf_bit_size.saturating_sub(pgb.bits_count());
-                let continuation_complete = num_bits_prev_frame <= remaining_packet_bits;
                 if num_bits_prev_frame >= remaining_packet_bits {
                     num_bits_prev_frame = remaining_packet_bits;
                     self.packet_done = true;
                 }
                 self.save_bits(&mut pgb, num_bits_prev_frame, true);
-                if !self.packet_loss && continuation_complete {
+                if !self.packet_loss {
                     let (_, gf) = self.decode_frame(out_frame);
                     got_frame = gf;
                 }
@@ -1899,35 +1915,12 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
-    fn incomplete_continuation_remains_buffered_for_the_next_packet() {
-        let mut decoder = StreamDecoder::new(Version::Xma2, 1, 48_000);
-        decoder.packet_loss = false;
-        decoder.packet_done = true;
-        decoder.reservoir.put_bits(15, 300);
-        decoder.num_saved_bits = 15;
-        let mut packet = BitWriter::new();
-        packet.put_bits(6, 0);
-        packet.put_bits(15, 200); // more continuation bits than fit in this packet
-        packet.put_bits(3, 0);
-        packet.put_bits(8, 0);
-        let mut output = [[0.0; SAMPLES_PER_FRAME]; MAX_CHANNELS_PER_STREAM];
-        let result = decoder.decode_packet_step(&packet.buf[..16], &mut output);
-        assert_eq!(result, Ok((16, false)));
-        assert_eq!(decoder.num_saved_bits, 15 + 96);
-        assert_eq!(decoder.reservoir.bit_pos, 15 + 96);
-        assert!(decoder.packet_done);
-        assert!(!decoder.packet_loss);
-
-        let mut next = BitWriter::new();
-        next.put_bits(6, 0);
-        next.put_bits(15, 104); // 200 - 96: this packet still cannot finish the frame
-        next.put_bits(3, 0);
-        next.put_bits(8, 0);
-        assert_eq!(decoder.decode_packet_step(&next.buf[..16], &mut output), Ok((16, false)));
-        assert_eq!(decoder.num_saved_bits, 15 + 2 * 96);
-        assert_eq!(decoder.reservoir.bit_pos, 15 + 2 * 96);
-        assert!(decoder.packet_done);
-        assert!(!decoder.packet_loss);
+    fn quant_gains_match_power_at_and_beyond_both_limits() {
+        let st = static_tables();
+        for exp in (-2000..=2000).chain([i32::MIN, i32::MAX]) {
+            let expected = 10.0_f64.powf(exp as f64 / 20.0) as f32;
+            assert_eq!(st.quant_gain(exp).to_bits(), expected.to_bits(), "exponent {exp}");
+        }
     }
 
     // FFmpeg-verified synthetic XMA2/XMA1 test packets (copyright-free spectral tones;

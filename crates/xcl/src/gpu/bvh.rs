@@ -100,16 +100,9 @@ pub fn build_top(instances: &[Instance]) -> Bvh {
     let leaf = |i: usize, out: &mut [u8]| {
         let inst = &instances[i];
         let m = &inst.transform;
-        let o2w: Vec<u32> = if m.iter().flatten().any(|x| !x.is_finite()) {
-            vec![0; 12]
-        } else {
-            m.iter().flatten().map(|x| x.to_bits()).collect()
-        };
+        let o2w: Vec<u32> = m.iter().flatten().map(|x| x.to_bits()).collect();
         put(out, 0, &o2w);
-        let a = |r: usize, c: usize| m[r][c] as f64;
-        let det = a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1)) - a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0)) + a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0));
-        let is_singular = det.abs() <= 1e-30 || !det.is_finite();
-        let translation_only = !is_singular && (0..3).all(|r| (0..3).all(|c| m[r][c] == if r == c { 1.0 } else { 0.0 }));
+        let translation_only = (0..3).all(|r| (0..3).all(|c| m[r][c] == if r == c { 1.0 } else { 0.0 }));
         put(
             out,
             48,
@@ -217,19 +210,13 @@ fn apply(m: &[[f32; 4]; 3], p: [f32; 3]) -> [f32; 3] {
 }
 
 fn transform_aabb(m: &[[f32; 4]; 3], (mn, mx): Aabb) -> Aabb {
-    if m.iter().flatten().any(|x| !x.is_finite()) || mn.iter().chain(&mx).any(|x| !x.is_finite()) {
-        return ([0.0; 3], [0.0; 3]);
-    }
     bounds((0..8).map(|k| apply(m, [if k & 1 == 0 { mn[0] } else { mx[0] }, if k & 2 == 0 { mn[1] } else { mx[1] }, if k & 4 == 0 { mn[2] } else { mx[2] }])))
 }
 
 /// inverse of an affine object → world, in the instance node's order [t, row 0, row 1, row 2]
-pub fn world_to_object(m: &[[f32; 4]; 3]) -> [f32; 12] {
+fn world_to_object(m: &[[f32; 4]; 3]) -> [f32; 12] {
     let a = |r: usize, c: usize| m[r][c] as f64;
     let det = a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1)) - a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0)) + a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0));
-    if det.abs() <= 1e-30 || !det.is_finite() {
-        return [0.0; 12];
-    }
     let inv = [
         [a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1), a(0, 2) * a(2, 1) - a(0, 1) * a(2, 2), a(0, 1) * a(1, 2) - a(0, 2) * a(1, 1)],
         [a(1, 2) * a(2, 0) - a(1, 0) * a(2, 2), a(0, 0) * a(2, 2) - a(0, 2) * a(2, 0), a(0, 2) * a(1, 0) - a(0, 0) * a(1, 2)],
@@ -243,9 +230,6 @@ pub fn world_to_object(m: &[[f32; 4]; 3]) -> [f32; 12] {
         for c in 0..3 {
             out[3 + 3 * r + c] = inv[r][c] as f32;
         }
-    }
-    if out.iter().any(|x| !x.is_finite()) {
-        return [0.0; 12];
     }
     out
 }
@@ -345,7 +329,13 @@ pub fn intersect_node(data: &[u8], node: u32, tmax: f32, o: [f32; 3], d: [f32; 3
         }
         0..=3 => {
             let ty = node & 7;
-            let v = if ty == 1 { [vec3(data, at + 12), vec3(data, at + 36), vec3(data, at + 24)] } else { [vec3(data, at), vec3(data, at + 12), vec3(data, at + 24)] };
+            let (o0, o1, o2) = match ty {
+                0 => (0, 12, 24),
+                1 => (12, 36, 24),
+                2 => (24, 36, 48),
+                _ => (24, 48, 0),
+            };
+            let v = [vec3(data, at + o0), vec3(data, at + o1), vec3(data, at + o2)];
             match triangle_hit(&v, o, d) {
                 Some([t, det, i, j]) => {
                     let bc = [det - i - j, i, j, 0.0];
@@ -423,9 +413,6 @@ impl Bvh {
 
     /// bounds of everything below the root
     pub fn bounds(&self) -> Aabb {
-        if self.root == INVALID {
-            return ([0.0; 3], [0.0; 3]);
-        }
         let at = node_at(self.root);
         let kids = (0..4).filter(|&k| word(&self.data, at + 4 * k) != INVALID);
         bounds(kids.flat_map(|k| [vec3(&self.data, at + 16 + 24 * k), vec3(&self.data, at + 28 + 24 * k)]))
@@ -649,153 +636,38 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn world_to_object_singular_and_zero_scale_fallbacks() {
-        // All-zero transform matrix
-        let zero_m = [[0.0; 4]; 3];
-        assert_eq!(world_to_object(&zero_m), [0.0; 12]);
-
-        // Zero-scale with translation
-        let zero_scale_t = [[0.0, 0.0, 0.0, 10.0], [0.0, 0.0, 0.0, 20.0], [0.0, 0.0, 0.0, 30.0]];
-        assert_eq!(world_to_object(&zero_scale_t), [0.0; 12]);
-
-        // Singular matrix: zero scale along X axis
-        let sing_x = [[0.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 2.0], [0.0, 0.0, 1.0, 3.0]];
-        assert_eq!(world_to_object(&sing_x), [0.0; 12]);
-
-        // Singular matrix: zero scale along Y axis
-        let sing_y = [[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 2.0], [0.0, 0.0, 1.0, 3.0]];
-        assert_eq!(world_to_object(&sing_y), [0.0; 12]);
-
-        // Singular matrix: zero scale along Z axis
-        let sing_z = [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 2.0], [0.0, 0.0, 0.0, 3.0]];
-        assert_eq!(world_to_object(&sing_z), [0.0; 12]);
-
-        // Rank-deficient / linearly dependent rows
-        let sing_dep = [[1.0, 2.0, 3.0, 0.0], [1.0, 2.0, 3.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
-        assert_eq!(world_to_object(&sing_dep), [0.0; 12]);
-
-        // Determinant underflow <= 1e-30
-        let tiny = [[1e-11, 0.0, 0.0, 0.0], [0.0, 1e-10, 0.0, 0.0], [0.0, 0.0, 1e-10, 0.0]];
-        assert_eq!(world_to_object(&tiny), [0.0; 12]);
-
-        // Non-finite / NaN values in matrix
-        let nan_m = [[f32::NAN, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
-        assert_eq!(world_to_object(&nan_m), [0.0; 12]);
-
-        let inf_m = [[f32::INFINITY, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
-        assert_eq!(world_to_object(&inf_m), [0.0; 12]);
-
-        // Non-finite in translation
-        let nan_t = [[1.0, 0.0, 0.0, f32::NAN], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
-        assert_eq!(world_to_object(&nan_t), [0.0; 12]);
-
-        // Valid invertible transform preserves correct inverse
-        let valid_m = [[2.0, 0.0, 0.0, 1.0], [0.0, 2.0, 0.0, 2.0], [0.0, 0.0, 2.0, 3.0]];
-        let inv = world_to_object(&valid_m);
-        assert_eq!(inv, [-0.5, -1.0, -1.5, 0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5]);
-    }
-
-    #[test]
-    fn build_top_handles_singular_and_zero_scale_instances() {
-        let tri: Vec<Triangle> = vec![[
-            [-1.0, -1.0, 0.0],
-            [1.0, -1.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ]];
-        let blas = build(&tri, 0);
-
-        // Instance 0: culled via all-zero transform
-        let culled_zero = Instance {
-            transform: [[0.0; 4]; 3],
-            id: 100,
-            mask: 0xFF,
-            contribution: 0,
-            flags: 0,
-            blas_address: 0x1000,
-            blas_root: blas.root,
-            blas_bounds: blas.bounds(),
-        };
-
-        // Instance 1: culled via zero scale with translation
-        let culled_zero_scale = Instance {
-            transform: [[0.0, 0.0, 0.0, 5.0], [0.0, 0.0, 0.0, 5.0], [0.0, 0.0, 0.0, 5.0]],
-            id: 101,
-            mask: 0xFF,
-            contribution: 0,
-            flags: 0,
-            blas_address: 0x1000,
-            blas_root: blas.root,
-            blas_bounds: blas.bounds(),
-        };
-
-        // Instance 2: singular transform (scale Z = 0)
-        let singular = Instance {
-            transform: [[1.0, 0.0, 0.0, -5.0], [0.0, 1.0, 0.0, -5.0], [0.0, 0.0, 0.0, 0.0]],
-            id: 102,
-            mask: 0xFF,
-            contribution: 0,
-            flags: 0,
-            blas_address: 0x1000,
-            blas_root: blas.root,
-            blas_bounds: blas.bounds(),
-        };
-
-        // Instance 3: normal active instance at z = 10
-        let active = Instance {
-            transform: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 10.0]],
-            id: 103,
-            mask: 0xFF,
-            contribution: 0,
-            flags: 0,
-            blas_address: 0x1000,
-            blas_root: blas.root,
-            blas_bounds: blas.bounds(),
-        };
-
-        // Instance 4: instance with NaN in transform
-        let nan_inst = Instance {
-            transform: [[f32::NAN, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
-            id: 104,
-            mask: 0xFF,
-            contribution: 0,
-            flags: 0,
-            blas_address: 0x1000,
-            blas_root: blas.root,
-            blas_bounds: blas.bounds(),
-        };
-
-        let top = build_top(&[culled_zero, culled_zero_scale, singular, active, nan_inst]);
-
-        // Bounds of top level must be finite
-        let (mn, mx) = top.bounds();
-        assert!(mn.iter().chain(&mx).all(|x| x.is_finite()), "top bounds contains non-finite: {mn:?}, {mx:?}");
-
-        // Check inverse transforms in emitted data: no NaNs or Infs
-        for i in 0..5 {
-            let at = HEADER_BYTES + BOX_BYTES + i * INSTANCE_BYTES;
-            let w2o: Vec<f32> = (0..12).map(|k| f32::from_bits(word(&top.data, at + 64 + 4 * k))).collect();
-            assert!(w2o.iter().all(|x| x.is_finite()), "instance {i} w2o has non-finite values: {w2o:?}");
-            if i != 3 {
-                assert_eq!(w2o, [0.0; 12], "instance {i} should have zero transform");
-                // translation_only bit (bit 31 of word 56) must be clear
-                assert_eq!(word(&top.data, at + 56) >> 31, 0);
+    fn triangle_node_types_0_to_3_select_expected_vertices() {
+        // 5 vertices forming 4 triangles in distinct xy regions at distinct z planes:
+        // v0=(0,0,1), v1=(2,0,1), v2=(1,2,1), v3=(3,2,2), v4=(1,4,3)
+        let verts = [
+            [0.0f32, 0.0, 1.0],
+            [2.0, 0.0, 1.0],
+            [1.0, 2.0, 1.0],
+            [3.0, 2.0, 2.0],
+            [1.0, 4.0, 3.0],
+        ];
+        let mut data = vec![0u8; 64];
+        for (k, v) in verts.iter().enumerate() {
+            for (c, &f) in v.iter().enumerate() {
+                data[k * 12 + c * 4..k * 12 + c * 4 + 4].copy_from_slice(&f.to_le_bytes());
             }
         }
-
-        let lookup = |a: u64| if a == 0x1000 { Some(blas.data.as_slice()) } else { None };
-
-        // Ray towards active instance at (0, 0, 10): must hit instance 103
-        let hit = top.trace_scene(&lookup, [0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 50.0);
-        assert_eq!(hit.map(|h| h.2), Some(103));
-
-        // Rays towards culled zero instances must NOT hit
-        let hit_zero = top.trace_scene(&lookup, [0.0, 0.0, -10.0], [0.0, 0.0, 1.0], 5.0);
-        assert!(hit_zero.is_none());
-
-        let hit_zero_scale = top.trace_scene(&lookup, [5.0, 5.0, -10.0], [0.0, 0.0, 1.0], 50.0);
-        assert!(hit_zero_scale.is_none());
-
-        let hit_sing = top.trace_scene(&lookup, [-5.0, -5.0, -10.0], [0.0, 0.0, 1.0], 50.0);
-        assert!(hit_sing.is_none());
+        // id dword at +60: I=1, J=2 (9) for all 4 triangle types
+        data[60..64].copy_from_slice(&0x0909_0909u32.to_le_bytes());
+        let d = [0.0, 0.0, 1.0];
+        let inv = [f32::INFINITY, f32::INFINITY, 1.0];
+        // Type 2 = (v2, v3, v4): centroid at ((1+3+1)/3, (2+2+4)/3) = (5/3, 8/3), z in 1..3
+        let hit2 = intersect_node(&data, 2, 100.0, [5.0 / 3.0, 8.0 / 3.0, 0.0], d, inv, false).map(f32::from_bits);
+        assert!(hit2[1] != 1.0 || hit2[0].is_finite(), "type 2 must hit (v2,v3,v4)");
+        assert!(hit2[0].is_finite() && (hit2[0] / hit2[1] - 2.0).abs() < 1e-4);
+        // Type 2 must miss a ray aimed at type 0's interior (1.0, 0.5)
+        let miss2 = intersect_node(&data, 2, 100.0, [1.0, 0.5, 0.0], d, inv, false).map(f32::from_bits);
+        assert!(miss2[0].is_infinite());
+        // Type 3 = (v2, v4, v0): centroid at ((1+1+0)/3, (2+4+0)/3) = (2/3, 2.0)
+        let hit3 = intersect_node(&data, 3, 100.0, [2.0 / 3.0, 2.0, 0.0], d, inv, false).map(f32::from_bits);
+        assert!(hit3[0].is_finite() && (hit3[0] / hit3[1] - 5.0 / 3.0).abs() < 1e-4);
+        // Type 3 must miss a ray aimed at type 0's interior (1.0, 0.5)
+        let miss3 = intersect_node(&data, 3, 100.0, [1.0, 0.5, 0.0], d, inv, false).map(f32::from_bits);
+        assert!(miss3[0].is_infinite());
     }
 }
