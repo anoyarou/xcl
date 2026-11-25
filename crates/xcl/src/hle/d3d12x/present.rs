@@ -613,6 +613,7 @@ struct Presenter {
     queue: usize,
     dev: ID3D12Device,
     sc: Option<IDXGISwapChain3>,
+    wine: Option<WineQueue>,
     w: u32,
     h: u32,
     fmt: DXGI_FORMAT,
@@ -658,22 +659,94 @@ unsafe fn transition(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after:
     }
 }
 
+struct WineQueue {
+    queue: ID3D12CommandQueue,
+    sync_fence: ID3D12Fence,
+    sync_value: u64,
+}
+
+unsafe fn create_pc_queue(dev_raw: *mut c_void, dev: &ID3D12Device) -> Option<ID3D12CommandQueue> {
+    let desc = D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() };
+    if !super::real::is_adopted(dev_raw) {
+        return dev.CreateCommandQueue(&desc).ok();
+    }
+    type F = unsafe extern "system" fn(*mut c_void, *const D3D12_COMMAND_QUEUE_DESC, *const windows::core::GUID, *mut *mut c_void) -> windows::core::HRESULT;
+    let f: F = std::mem::transmute(super::real::orig_fn(dev_raw, 8));
+    let mut raw = std::ptr::null_mut();
+    if f(dev_raw, &desc, &ID3D12CommandQueue::IID, &mut raw).is_err() || raw.is_null() {
+        return None;
+    }
+    Some(ID3D12CommandQueue::from_raw(raw))
+}
+
+unsafe fn create_pc_allocator(dev_raw: *mut c_void, dev: &ID3D12Device) -> Option<ID3D12CommandAllocator> {
+    if !super::real::is_adopted(dev_raw) {
+        return dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok();
+    }
+    type F = unsafe extern "system" fn(*mut c_void, D3D12_COMMAND_LIST_TYPE, *const windows::core::GUID, *mut *mut c_void) -> windows::core::HRESULT;
+    let f: F = std::mem::transmute(super::real::orig_fn(dev_raw, 9));
+    let mut raw = std::ptr::null_mut();
+    if f(dev_raw, D3D12_COMMAND_LIST_TYPE_DIRECT, &ID3D12CommandAllocator::IID, &mut raw).is_err() || raw.is_null() {
+        return None;
+    }
+    Some(ID3D12CommandAllocator::from_raw(raw))
+}
+
+unsafe fn create_pc_list(dev_raw: *mut c_void, dev: &ID3D12Device, alloc: &ID3D12CommandAllocator) -> Option<ID3D12GraphicsCommandList> {
+    if !super::real::is_adopted(dev_raw) {
+        return dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, None).ok();
+    }
+    type F = unsafe extern "system" fn(*mut c_void, u32, D3D12_COMMAND_LIST_TYPE, *mut c_void, *mut c_void, *const windows::core::GUID, *mut *mut c_void) -> windows::core::HRESULT;
+    let f: F = std::mem::transmute(super::real::orig_fn(dev_raw, 12));
+    let mut raw = std::ptr::null_mut();
+    if f(dev_raw, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.as_raw(), std::ptr::null_mut(), &ID3D12GraphicsCommandList::IID, &mut raw).is_err() || raw.is_null() {
+        return None;
+    }
+    Some(ID3D12GraphicsCommandList::from_raw(raw))
+}
+
+unsafe fn create_pc_fence(dev_raw: *mut c_void, dev: &ID3D12Device) -> Option<ID3D12Fence> {
+    if !super::real::is_adopted(dev_raw) {
+        return dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok();
+    }
+    type F = unsafe extern "system" fn(*mut c_void, u64, D3D12_FENCE_FLAGS, *const windows::core::GUID, *mut *mut c_void) -> windows::core::HRESULT;
+    let f: F = std::mem::transmute(super::real::orig_fn(dev_raw, 36));
+    let mut raw = std::ptr::null_mut();
+    if f(dev_raw, 0, D3D12_FENCE_FLAG_NONE, &ID3D12Fence::IID, &mut raw).is_err() || raw.is_null() {
+        return None;
+    }
+    Some(ID3D12Fence::from_raw(raw))
+}
+
 unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let dev_raw = super::real::device_raw();
     let dev = ID3D12Device::from_raw_borrowed(&dev_raw)?;
-    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
-    let spare_alloc = if present_slot_count() > 1 {
-        dev.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()
+    let (wine, alloc, spare_alloc, list, fence) = if crate::util::under_wine() {
+        let own_queue = create_pc_queue(dev_raw, dev)?;
+        let sync_fence = create_pc_fence(dev_raw, dev)?;
+        let alloc = create_pc_allocator(dev_raw, dev)?;
+        let spare_alloc = if present_slot_count() > 1 { create_pc_allocator(dev_raw, dev) } else { None };
+        let list = create_pc_list(dev_raw, dev, &alloc)?;
+        list.Close().ok()?;
+        let fence = create_pc_fence(dev_raw, dev)?;
+        crate::xlog_info!("present: using a dedicated PC direct queue under Wine");
+        (Some(WineQueue { queue: own_queue, sync_fence, sync_value: 0 }), alloc, spare_alloc, list, fence)
     } else {
-        None
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+        let spare_alloc = if present_slot_count() > 1 {
+            dev.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()
+        } else {
+            None
+        };
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
+        list.Close().ok()?;
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        (None, alloc, spare_alloc, list, fence)
     };
     let actual_slots = if spare_alloc.is_some() { 2 } else { 1 };
-    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
-    list.Close().ok()?;
-    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
-        queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN,
+        queue, wine, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN,
         alloc, spare_alloc, ring: PresentRing::new(actual_slots),
         slot_sources: vec![None; actual_slots], slot_dumps: (0..actual_slots).map(|_| Vec::new()).collect(),
         list, fence,
@@ -720,7 +793,8 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
         AlphaMode: DXGI_ALPHA_MODE_IGNORE,
         ..Default::default()
     };
-    match factory.CreateSwapChainForHwnd(queue, hwnd, &desc, None, None) {
+    let sc_queue = p.wine.as_ref().map(|w| &w.queue).unwrap_or(queue);
+    match factory.CreateSwapChainForHwnd(sc_queue, hwnd, &desc, None, None) {
         Ok(sc1) => {
             let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
             p.sc = sc1.cast::<IDXGISwapChain3>().ok();
@@ -845,16 +919,44 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     let qraw = queue as *mut c_void;
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
-    q.ExecuteCommandLists(&[Some(cl)]);
-    p.copy_source = Some(src);
-    p.dumps = dumps;
-    p.value += 1;
-    if let Err(e) = q.Signal(&p.fence, p.value) {
-        // The copy is already submitted. Without its signal, keep its resources and allocator.
-        p.disabled = true;
-        let e = fence::api_error(&p.dev, "Signal", e);
-        crate::xlog_error!("present: submit copy: {e}");
-        return;
+    if let Some(wine) = p.wine.as_mut() {
+        wine.sync_value += 1;
+        if let Err(e) = q.Signal(&wine.sync_fence, wine.sync_value) {
+            let e = fence::api_error(&p.dev, "Signal", e);
+            p.disabled = matches!(&e, FenceError::Removed(_));
+            crate::xlog_error!("present: sync title queue: {e}");
+            return;
+        }
+        if let Err(e) = wine.queue.Wait(&wine.sync_fence, wine.sync_value) {
+            let e = fence::api_error(&p.dev, "Wait", e);
+            p.disabled = matches!(&e, FenceError::Removed(_));
+            crate::xlog_error!("present: wait title queue: {e}");
+            return;
+        }
+        wine.queue.ExecuteCommandLists(&[Some(cl)]);
+        p.copy_source = Some(src);
+        p.dumps = dumps;
+        p.value += 1;
+        if let Err(e) = wine.queue.Signal(&p.fence, p.value) {
+            // The copy is already submitted. Without its signal, keep its resources and allocator.
+            p.disabled = true;
+            let e = fence::api_error(&p.dev, "Signal", e);
+            crate::xlog_error!("present: submit copy: {e}");
+            return;
+        }
+        let _ = q.Wait(&p.fence, p.value);
+    } else {
+        q.ExecuteCommandLists(&[Some(cl)]);
+        p.copy_source = Some(src);
+        p.dumps = dumps;
+        p.value += 1;
+        if let Err(e) = q.Signal(&p.fence, p.value) {
+            // The copy is already submitted. Without its signal, keep its resources and allocator.
+            p.disabled = true;
+            let e = fence::api_error(&p.dev, "Signal", e);
+            crate::xlog_error!("present: submit copy: {e}");
+            return;
+        }
     }
     if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
         let e = fence::api_error(&p.dev, "Present", e);
