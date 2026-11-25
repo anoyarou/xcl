@@ -3880,6 +3880,18 @@ fn huge_pso_concurrency() -> usize {
     *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_CONCURRENCY").ok().as_deref(), 1, 1, 64))
 }
 
+/// Hard cap on concurrent huge (`>= 256 KB`) driver compiles even when wanted by a title bind
+/// (`XCL_HUGE_PSO_WANTED_CONCURRENCY`, default 2, always `>= huge_pso_concurrency()`). Prevents a
+/// burst of lazy compute binds from launching 10+ huge driver compiles simultaneously and spiking
+/// process commit into OOM, while still letting a wanted build overtake 1 background build.
+fn huge_pso_wanted_concurrency() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let base = huge_pso_concurrency();
+        env_count(std::env::var("XCL_HUGE_PSO_WANTED_CONCURRENCY").ok().as_deref(), base.max(2), base, 64)
+    })
+}
+
 /// A count from the environment: `default` when unset or not a number, clamped to the
 /// inclusive range `min..=max`.
 fn env_count(v: Option<&str>, default: usize, min: usize, max: usize) -> usize {
@@ -3887,16 +3899,21 @@ fn env_count(v: Option<&str>, default: usize, min: usize, max: usize) -> usize {
 }
 
 /// A counting semaphore: background driver compiles of big programs at once (`most` 0: the
-/// `huge_pso_concurrency` of the environment).
+/// `huge_pso_concurrency` of the environment; `wanted_most` 0: `huge_pso_wanted_concurrency`).
 struct Slots {
     n: Mutex<usize>,
     cv: std::sync::Condvar,
     most: usize,
+    wanted_most: usize,
 }
 
 impl Slots {
     fn most(&self) -> usize {
         if self.most == 0 { huge_pso_concurrency() } else { self.most }
+    }
+
+    fn wanted_most(&self) -> usize {
+        if self.wanted_most == 0 { huge_pso_wanted_concurrency() } else { self.wanted_most }
     }
 }
 
@@ -3905,13 +3922,13 @@ struct SlotGuard(&'static Slots);
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         *self.0.n.lock().unwrap() -= 1;
-        self.0.cv.notify_one();
+        self.0.cv.notify_all();
     }
 }
 
-static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 0 };
+static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 0, wanted_most: 0 };
 const GIANT_DRIVER_COMPILE: usize = 4 << 20;
-static GIANT_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+static GIANT_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1 };
 
 fn compile_slots(bytes: usize) -> &'static Slots {
     if bytes >= GIANT_DRIVER_COMPILE { &GIANT_COMPILES } else { &BIG_COMPILES }
@@ -3972,22 +3989,19 @@ fn gate_compute_driver_compile(has_cached_blob: bool) -> bool {
     !has_cached_blob
 }
 
-/// Before a big driver compile in the background: its turn – at most the configured number at
-/// once, and 3 GB of commit
-/// free (each takes ~1.5 GB; the title loading next to it must not run out). Unless one of the
-/// title's threads waits for the pipeline (`wanted`): then at once and without a slot (None), as
-/// when that thread builds it itself. Holding such a build back holds the title back: on a
-/// machine with less than 3 GB of commit free throughout a retail title's world loading, the
-/// first one would not go on and keeps the slot, until the title's watchdog ends it.
+/// Before a big driver compile in the background: its turn – unwanted builds wait for `slots.most()`
+/// and 3 GB of commit free (each takes ~0.5–1.5 GB; the title loading next to it must not run out).
+/// When a title thread waits for the pipeline (`wanted`), it bypasses the 3 GB commit wait and can
+/// use up to `slots.wanted_most()` (default 2 for `>= 256 KB`, 1 for `>= 4 MiB` giant shaders) so a
+/// wanted build is not stuck behind 1 background build while a burst of 10+ lazy binds still cannot
+/// spike driver compiler commit into OOM.
 fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> Option<SlotGuard> {
     const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
     let slot = {
         let mut n = slots.n.lock().unwrap();
         loop {
-            if wanted() {
-                return None;
-            }
-            if *n < slots.most() {
+            let cap = if wanted() { slots.wanted_most() } else { slots.most() };
+            if *n < cap {
                 break;
             }
             n = slots.cv.wait_timeout(n, LOOK).unwrap().0;
@@ -3997,7 +4011,7 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
     };
     while !commit_free() {
         if wanted() {
-            return None;
+            return Some(slot);
         }
         std::thread::sleep(LOOK);
     }
@@ -4015,34 +4029,59 @@ fn big_compile_commit_free() -> bool {
 #[cfg(test)]
 mod big_compile_tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::{Duration, Instant};
 
     #[test]
-    fn a_wanted_build_waits_for_neither_the_slot_nor_the_commit() {
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+    fn wanted_builds_bypass_commit_and_unwanted_slot_but_respect_hard_cap() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2 };
         let held = big_compile_turn(&S, || true, || false).expect("a free slot");
         assert_eq!(*S.n.lock().unwrap(), 1);
-        // the slot is taken: a wanted build goes on without one, at once
-        assert!(big_compile_turn(&S, || true, || true).is_none());
-        // … and one that becomes wanted while it waits for the slot goes on then
-        static WANTED: AtomicBool = AtomicBool::new(false);
-        let t = std::thread::spawn(|| big_compile_turn(&S, || true, || WANTED.load(Ordering::Acquire)).is_none());
+        // Unwanted slot is full, but a wanted build immediately takes the 2nd (wanted) slot and
+        // bypasses the commit-free check.
+        let held_wanted = big_compile_turn(&S, || false, || true).expect("wanted slot within cap");
+        assert_eq!(*S.n.lock().unwrap(), 2);
+        // A 3rd wanted build MUST wait while both slots are occupied (hard cap = 2).
+        let t = std::thread::spawn(|| {
+            let _g = big_compile_turn(&S, || false, || true).expect("3rd wanted waits for slot");
+        });
         std::thread::sleep(Duration::from_millis(120));
-        assert!(!t.is_finished(), "not wanted yet: it waits for its turn");
-        WANTED.store(true, Ordering::Release);
-        assert!(t.join().unwrap());
+        assert!(!t.is_finished(), "3rd concurrent wanted huge compile must wait for hard cap");
+        drop(held_wanted);
+        t.join().unwrap();
         drop(held);
         assert_eq!(*S.n.lock().unwrap(), 0);
-        // without the commit: not wanted, it waits; wanted, it goes on and gives the slot back
+        // Without commit free: an unwanted build waits until it becomes wanted, then proceeds
+        // while still holding its slot.
         static WANTED2: AtomicBool = AtomicBool::new(false);
         let t0 = Instant::now();
-        let t = std::thread::spawn(|| big_compile_turn(&S, || false, || WANTED2.load(Ordering::Acquire)).is_none());
+        let t = std::thread::spawn(|| big_compile_turn(&S, || false, || WANTED2.load(Ordering::Acquire)).is_some());
         std::thread::sleep(Duration::from_millis(120));
-        assert!(!t.is_finished(), "no commit free: it waits");
+        assert!(!t.is_finished(), "no commit free: unwanted build waits");
         WANTED2.store(true, Ordering::Release);
         assert!(t.join().unwrap() && t0.elapsed() < Duration::from_secs(5));
         assert_eq!(*S.n.lock().unwrap(), 0, "the slot went back");
+    }
+
+    #[test]
+    fn wanted_burst_is_hard_capped_to_wanted_most() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2 };
+        static IN: AtomicUsize = AtomicUsize::new(0);
+        static PEAK: AtomicUsize = AtomicUsize::new(0);
+        let t: Vec<_> = (0..12)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let _g = big_compile_turn(&S, || false, || true).expect("wanted slot");
+                    let now = IN.fetch_add(1, Ordering::SeqCst) + 1;
+                    PEAK.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(15));
+                    IN.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        t.into_iter().for_each(|h| h.join().unwrap());
+        assert_eq!(PEAK.load(Ordering::SeqCst), 2, "12 concurrent wanted huge compiles must cap at 2");
+        assert_eq!(*S.n.lock().unwrap(), 0);
     }
 
     #[test]
@@ -4079,7 +4118,7 @@ mod big_compile_tests {
     #[test]
     fn the_concurrency_limit_holds_and_all_finish() {
         use std::sync::atomic::AtomicUsize;
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 2 };
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 2, wanted_most: 2 };
         static IN: AtomicUsize = AtomicUsize::new(0);
         static PEAK: AtomicUsize = AtomicUsize::new(0);
         // the two holders of the slots meet here: both are inside at once, deterministically
@@ -4125,7 +4164,7 @@ mod big_compile_tests {
 
     #[test]
     fn unwanted_builds_go_one_at_a_time_when_the_commit_is_there() {
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2 };
         let first = big_compile_turn(&S, || true, || false).expect("its turn");
         let t = std::thread::spawn(|| big_compile_turn(&S, || true, || false).is_some());
         std::thread::sleep(Duration::from_millis(120));
