@@ -154,6 +154,7 @@ struct Lower<'a, I: Ir> {
     ssa: Ssa<I::V>,
     sum: &'a Summary,
     guarded: HashSet<u64>,
+    wave_branches: bool,
     wave64: bool,
     /// the markers: a number where a mask was written, a bit where a number was
     num_marker: I::V,
@@ -532,6 +533,18 @@ impl<'a, I: Ir> Lower<'a, I> {
         })
     }
 
+    /// A mask-producing scalar operation sets SCC from its full result. In the native
+    /// wave CFG every lane reaches scalar instructions, including lanes outside EXEC.
+    fn mask_nonzero(&mut self, bit: I::V) -> I::V {
+        if !self.wave_branches {
+            return bit;
+        }
+        let [lo, hi] = self.ir.ballot(bit);
+        let word = if self.wave64 { self.ir.bin(Bin::Or, lo, hi) } else { lo };
+        let zero = self.ir.int(0);
+        self.ir.icmp(Cmp::Ne, word, zero)
+    }
+
     fn salu(&mut self, b: usize, d: &Decoded) -> R<()> {
         let name = d.inst.name;
         let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f);
@@ -575,7 +588,8 @@ impl<'a, I: Ir> Lower<'a, I> {
                 if sd != 125 {
                     self.write_bit(b, sd, if base.ends_with("_WREXEC") { new } else { old });
                 }
-                self.write_scc(b, new);
+                let scc = self.mask_nonzero(new);
+                self.write_scc(b, scc);
                 return Ok(());
             }
             if op == "CSELECT" && (sd == EXEC || reads_mask) {
@@ -598,7 +612,8 @@ impl<'a, I: Ir> Lower<'a, I> {
                 };
                 self.write_bit(b, sd, v);
                 if op != "MOV" {
-                    self.write_scc(b, v);
+                    let scc = self.mask_nonzero(v);
+                    self.write_scc(b, scc);
                 }
                 return Ok(());
             }
@@ -608,6 +623,7 @@ impl<'a, I: Ir> Lower<'a, I> {
         if cmp64.contains(&name) && [s0, s1].iter().any(|&c| c <= 127 && self.holds_mask(b, c as u8)) {
             let (a, c) = (self.src_bit(b, d, s0)?, self.src_bit(b, d, s1)?);
             let x = self.ir.bin(Bin::Xor, a, c);
+            let x = self.mask_nonzero(x);
             let v = if name == cmp64[0] { self.not(x) } else { x };
             self.write_scc(b, v);
             return Ok(());
@@ -992,18 +1008,27 @@ impl<'a, I: Ir> Lower<'a, I> {
                 self.not(s)
             }
             n @ ("S_CBRANCH_VCCZ" | "S_CBRANCH_VCCNZ") => {
-                let (v, e) = (self.read_bit(b, VCC)?, self.read_bit(b, EXEC)?);
-                let c = self.ir.bin(Bin::And, v, e);
+                let v = self.read_bit(b, VCC)?;
+                let c = if self.wave_branches {
+                    self.mask_nonzero(v)
+                } else {
+                    let e = self.read_bit(b, EXEC)?;
+                    self.ir.bin(Bin::And, v, e)
+                };
                 if n == "S_CBRANCH_VCCZ" {
                     self.not(c)
                 } else {
                     c
                 }
             }
-            "S_CBRANCH_EXECNZ" => self.read_bit(b, EXEC)?,
+            "S_CBRANCH_EXECNZ" => {
+                let e = self.read_bit(b, EXEC)?;
+                self.mask_nonzero(e)
+            }
             "S_CBRANCH_EXECZ" => {
                 let e = self.read_bit(b, EXEC)?;
-                self.not(e)
+                let c = self.mask_nonzero(e);
+                self.not(c)
             }
             n => return Err(format!("unsupported branch {n}")),
         })
@@ -1060,6 +1085,9 @@ impl<'a, I: Ir> Lower<'a, I> {
 /// counts: the lanes that leave do not come back to it).
 fn partial_blocks(sum: &Summary) -> Vec<bool> {
     let n = sum.blocks.len();
+    if sum.lane_branches == 0 {
+        return vec![false; n];
+    }
     let words = (n + 1).div_ceil(64);
     // post-dominators over the blocks the entry reaches, with a virtual exit n
     let full = vec![!0u64; words];
@@ -1148,7 +1176,10 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
     // vertex invocation being one lane
     let pixel = matches!(stage, Stage::Pixel);
     let launch = if pixel { lane_masks::LaunchExec::Unknown } else { lane_masks::LaunchExec::All };
-    let sum = lane_masks::analyze_launch(insts, wave64, launch).map_err(|e| e.to_string())?;
+    // Ballots reconstruct every bit only when the entire console wave is present.
+    let wave_branches = matches!(stage, Stage::Compute(cs) if cs.threads.iter().product::<u32>() % (if wave64 { 64 } else { 32 }) == 0)
+        && !ir.whole_needs_exchange();
+    let sum = lane_masks::analyze_branches(insts, wave64, launch, wave_branches).map_err(|e| e.to_string())?;
     let n = sum.blocks.len();
     if n == 0 {
         return Err("empty program".into());
@@ -1221,6 +1252,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
 
         sum: &sum,
         guarded,
+        wave_branches,
         wave64,
         num_marker,
         bit_marker,
@@ -3205,6 +3237,87 @@ pub(crate) mod tests {
         let (s, v) = state(32);
         let (_, v) = run(&uniform, false, &s, &v);
         assert!(v.iter().all(|r| r[1] == 7));
+    }
+
+    /// Only the last lane has a VCC bit. The branches inspect VCC after EXEC has been
+    /// narrowed to the other lanes. Each case stores the scalar decision at mem[thread].
+    pub(crate) fn wave_branch_cases(wave64: bool) -> Vec<(Vec<I>, u32)> {
+        let cmp: I = if wave64 {
+            ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 191), ("VSRC1", 0)])
+        } else {
+            ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 159), ("VSRC1", 0)])
+        };
+        let (narrow, restore, eq, lg) = if wave64 {
+            ("S_ANDN2_B64", "S_MOV_B64", "S_CMP_EQ_U64", "S_CMP_LG_U64")
+        } else {
+            ("S_ANDN2_B32", "S_MOV_B32", "S_CMP_EQ_U32", "S_CMP_LG_U32")
+        };
+        let mut cases: Vec<(Vec<I>, u32)> = Vec::new();
+        for (branch, expected) in [("S_CBRANCH_VCCNZ", 5), ("S_CBRANCH_VCCZ", 9), ("S_CBRANCH_EXECNZ", 5),
+            ("S_CBRANCH_EXECZ", 9), ("S_CBRANCH_SCC1", 5), ("S_CBRANCH_SCC0", 9)] {
+            cases.push((vec![
+                cmp,
+                (narrow, "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 106)]),
+                ("S_MOV_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 133)]),
+                (branch, "ENC_SOPP", &[("SIMM16", 1)]),
+                ("S_MOV_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 137)]),
+                (restore, "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)]),
+            ], expected));
+        }
+        for (compare, expected) in [(eq, 9), (lg, 5)] {
+            cases.push((vec![
+                cmp,
+                (compare, "ENC_SOPC", &[("SSRC0", 106), ("SSRC1", 128)]),
+                ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 133), ("SSRC1", 137)]),
+            ], expected));
+        }
+        if !wave64 {
+            // The second iteration's CSELECT reads the mask-derived SCC on the
+            // backedge (thehollowedone, #1745).
+            cases.push((vec![
+                ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 130)]),
+                ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+                ("S_CMP_GT_U32", "ENC_SOPC", &[("SSRC0", 129), ("SSRC1", 128)]),
+                ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 133), ("SSRC1", 135)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 6)]),
+                ("S_SUB_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 129)]),
+                ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 128)]),
+                ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 2)]),
+                ("S_AND_B32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 106), ("SSRC1", 126)]),
+                ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0xfff9)]),
+            ], 5));
+            // The bitwise op reads both a mask and a number (Pipodi, #1745).
+            cases.push((vec![
+                ("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 133)]),
+                ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+                ("S_AND_B32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 106), ("SSRC1", 8)]),
+                ("S_MOV_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 135)]),
+                ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)]),
+                ("S_MOV_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 129)]),
+            ], 1));
+        }
+        for (lines, _) in &mut cases {
+            lines.extend_from_slice(&[
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 6)]),
+                ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 0)]),
+                ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 2), ("DATA", 1), ("SADDR", 125)]),
+                ENDPGM,
+            ]);
+        }
+        cases
+    }
+
+    #[test]
+    fn native_wave_branches_keep_inactive_lanes_in_scalar_control_flow() {
+        for wave64 in [false, true] {
+            let lanes = if wave64 { 64 } else { 32 };
+            let mut cs = compute_cs();
+            cs.threads = [lanes, 1, 1];
+            for (lines, expected) in wave_branch_cases(wave64) {
+                let got = run_compute_waves(&lines, &cs, wave64, 1, &[], &vec![0; lanes as usize]);
+                assert!(got.iter().all(|&word| word == expected), "wave{lanes}, {lines:?}: {got:?}");
+            }
+        }
     }
 
     /// A cross-lane scalar op on s0 holding a number takes the number path (the check for the

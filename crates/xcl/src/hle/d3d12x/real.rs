@@ -5380,6 +5380,71 @@ unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
     shader_bytes(&b)
 }
 
+/// The passthrough mesh shader emits triangles for both translated MS and GS pipelines.
+fn two_pass_mesh_stream(rs: *mut c_void, ms: &[u8], ps: Option<&[u8]>) -> StreamOut {
+    let mut out = StreamOut::default();
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
+    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+    if let Some(ps) = ps {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
+    }
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    out
+}
+
+#[cfg(test)]
+#[test]
+fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
+    use crate::gpu::recomp::{dxc, runner};
+    if dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if super::backend() != super::Backend::Real {
+        return runner::skip_test("no GPU");
+    }
+    let raw = device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap();
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    if unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, (&mut options as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS7).cast(), std::mem::size_of_val(&options) as u32) }.is_err()
+        || options.MeshShaderTier.0 < D3D12_MESH_SHADER_TIER_1.0
+    {
+        return runner::skip_test("no mesh shaders");
+    }
+    let (ms, _) = dummy_mesh().expect("compile a synthetic triangle mesh shader");
+    unsafe {
+        let mut sig = None;
+        D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut sig, None).unwrap();
+        let sig = sig.unwrap();
+        let rs: ID3D12RootSignature = dev.CreateRootSignature(
+            0, std::slice::from_raw_parts(sig.GetBufferPointer() as *const u8, sig.GetBufferSize()),
+        ).unwrap();
+        let create: PsoFn = std::mem::transmute(orig_fn(raw, slot_of(raw, "CreatePipelineState")));
+        let build = |stream: &StreamOut| {
+            let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+            let mut pso = std::ptr::null_mut();
+            let hr = create(raw, desc.as_ptr().cast(), &pc_iid(Kind::PipelineState), &mut pso);
+            assert!(hr >= 0 && !pso.is_null(), "mesh PSO creation failed ({hr:#x})");
+            ID3D12PipelineState::from_raw(pso)
+        };
+
+        let mut reference = StreamOut::default();
+        reference.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs.as_raw());
+        reference.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+        reference.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+        let blob = build(&reference).GetCachedBlob().unwrap();
+        let mut translated = two_pass_mesh_stream(rs.as_raw(), ms, None);
+        let subobjects = stream_subobjects(&translated.0).unwrap();
+        let topology = subobjects.iter().find(|(kind, _)| *kind == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32);
+        assert_eq!(topology.map(|(_, payload)| *payload), Some(D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0.to_le_bytes().as_slice()));
+        translated.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &D3D12_CACHED_PIPELINE_STATE {
+            pCachedBlob: blob.GetBufferPointer(),
+            CachedBlobSizeInBytes: blob.GetBufferSize(),
+        });
+        build(&translated);
+    }
+}
+
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
 fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
@@ -5530,14 +5595,9 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
-    let mut out = StreamOut::default();
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
-    if let Some(p) = &ps {
-        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
-    }
+    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
     for (ty, payload) in &subs {
-        let skip = [0, 2, 19, 24, 25].contains(ty); // RS, PS, cached PSO, AS, MS
+        let skip = [0, 2, 14, 19, 24, 25].contains(ty); // RS, PS, topology, cached PSO, AS, MS
         if !skip {
             let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
             // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's
@@ -5605,12 +5665,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
         }
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return E_INVALIDARG };
-    let mut out = StreamOut::default();
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
-    if let Some(p) = &ps {
-        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
-    }
+    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &d.BlendState);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &d.SampleMask);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &d.RasterizerState);

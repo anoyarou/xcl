@@ -754,6 +754,20 @@ mod tests {
     }
 
     #[test]
+    fn native_wave_branches_on_the_gpu() {
+        if !gpu() {
+            return;
+        }
+        let mut cs = compute_cs();
+        cs.threads = [32, 1, 1];
+        for (lines, expected) in wave_branch_cases(false) {
+            let dxil = super::compute(&decode(&lines), &cs, false).unwrap();
+            let out = runner::dispatch(&dxil, [1, 1, 1], &[], &[0; 32]).unwrap();
+            assert_eq!(&out[..32], &[expected; 32], "{lines:?}");
+        }
+    }
+
+    #[test]
     fn a_per_lane_compute_program_runs_on_the_gpu() {
         if !gpu() {
             return;
