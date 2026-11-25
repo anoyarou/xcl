@@ -283,11 +283,19 @@ unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs
         readback.Unmap(0, None);
         Ok(got)
     };
-    let got = run();
+    let got = match run() {
+        Ok(got) => got,
+        Err(e) => {
+            // The copy may still be running: what it uses stays (a few KiB, once). Released under
+            // the GPU, vkd3d-proton frees it at once and the GPU faults (RADV: page faults, then a
+            // ring timeout) – a slow first use of the imported window is enough to get here.
+            std::mem::forget((queue, alloc, list, fence, readback));
+            return Err(e);
+        }
+    };
     for &(_, _, p, _) in &probes {
         u.free(p);
     }
-    let got = got?;
     let wrong: Vec<String> =
         probes.iter().filter(|&&(_, i, _, c)| got[i] != c).map(|&(k, i, _, c)| format!("window {k}: wrote {c:#x}, the GPU read {:#x}", got[i])).collect();
     if !wrong.is_empty() {

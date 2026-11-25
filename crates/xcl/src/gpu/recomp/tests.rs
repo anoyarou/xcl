@@ -2307,6 +2307,166 @@ fn gpu_wave64_vs_spill_slots_and_identity() {
     }
 }
 
+/// Masks in whole-quad mode hold the helper lanes (#105): after `s_wqm` the helper pixels of a
+/// quad a primitive's edge splits are in EXEC, and the console's `v_cmp` sets their bits like
+/// any other lane's. Wave ops leave helper lanes out before SM 6.7, so a mask taken with
+/// `WaveActiveBallot` alone had them 0: `v_cndmask` gave them the false value, `s_and_saveexec`
+/// dropped them, and a derivative taken across the quad by hand (DPP) was wrong along the
+/// diagonal of two triangles. A waterfall loop over `v_readfirstlane` never removed a helper
+/// lane from EXEC and ran into the loop budget. The target is two triangles sharing the
+/// diagonal; per pixel: |ddx| of a value picked by `v_cndmask`, |ddy| of a value written
+/// under `s_and_saveexec` (both 1 everywhere), and the waterfall loop's iteration count.
+#[test]
+fn gpu_ps_masks_hold_helper_lanes_on_triangle_edges() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+    let vs = super::dxc::compile("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0.5, 1.0); }\n", "main", "vs_6_6", &[]).unwrap();
+    for wave64 in [true, false] {
+        let pt = helper_lane_masks_ps(wave64);
+        assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
+        let ps = super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+        // the whole target as two triangles sharing the diagonal x = y
+        let quad = [-1.0f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
+        let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+        let size = 32usize;
+        let px = runner::draw(&vs, &ps, &layout, &quad, 8, &[], &[], size as u32, [9.0; 4]).unwrap();
+        let lanes = if wave64 { 64.0 } else { 32.0 };
+        let bad: Vec<(usize, usize, [f32; 4])> = (0..size * size)
+            .filter(|&i| {
+                let p = px[i];
+                p[0].abs() != 1.0 || p[1].abs() != 1.0 || !(1.0..=lanes).contains(&p[2]) || p[3] != 1.0
+            })
+            .map(|i| (i % size, i / size, px[i]))
+            .collect();
+        let count = |k: usize, ok: &dyn Fn(f32) -> bool| px.iter().filter(|p| !ok(p[k])).count();
+        let (dx, dy, it) = (count(0, &|v| v.abs() == 1.0), count(1, &|v| v.abs() == 1.0), count(2, &|v| (1.0..=lanes).contains(&v)));
+        println!("wave64 {wave64}: {} of {} pixels wrong (ddx {dx}, ddy {dy}, loop {it}), first: {:?}", bad.len(), size * size, bad.iter().take(6).collect::<Vec<_>>());
+        assert!(bad.is_empty(), "wave64 {wave64}: {} pixels wrong (ddx {dx}, ddy {dy}, loop {it}; |ddx|, |ddy|, loop iterations, 1), first {:?}", bad.len(), &bad[..bad.len().min(6)]);
+    }
+}
+
+/// The masks of a waterfall loop in a pixel shader take the helper lanes' bits from quad reads
+/// of the compare's vector operand, not of the compare (#134): AMD's RDNA2 compiler crashed in
+/// `CreateGraphicsPipelineState` on quad reads of a value computed from a `WaveReadLaneAt` in a
+/// loop (WarmMilkCodes, RX 6600 XT), which `ballot_px` gave the loop's `v_cmp`. Outside loops too:
+/// AMD's RDNA3 compiler crashed on a `WaveReadLaneAt` whose lane came from such a mask, with no
+/// loop (`s_ff1` of it → `v_readlane`, RX 7800 XT), so every mask `quad_bits` can express takes
+/// this form. CPU only: what the GPU sees is `gpu_ps_masks_hold_helper_lanes_on_triangle_edges`.
+#[test]
+fn ps_masks_in_loops_quad_read_the_operands_not_the_compare() {
+    for wave64 in [true, false] {
+        let pt = helper_lane_masks_ps(wave64);
+        assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
+        let (before, rest) = pt.hlsl.split_once("[loop] for (;;) {").unwrap_or_else(|| panic!("no loop\n{}", pt.hlsl));
+        let body = &rest[..rest.find("\n    }\n").unwrap_or_else(|| panic!("no loop end\n{}", pt.hlsl))];
+        assert!(!body.contains("ballot_px(") && !body.contains("QuadReadAcross"), "wave64 {wave64}: a quad read of a compare in the loop\n{body}");
+        assert!(body.contains("ballot_px_quad(") && body.contains("QuadReadLaneAt(v2, 3u)"), "wave64 {wave64}: the loop's v_cmp without its operand's quad reads\n{body}");
+        // one read per register and member, though the float compare names v2 twice (NaN test, ==)
+        assert_eq!(body.matches("QuadReadLaneAt(v2, ").count(), 4, "wave64 {wave64}\n{body}");
+        assert!(!before.contains("= ballot_px(and(") && before.contains("ballot_px_quad("), "wave64 {wave64}: a mask before the loop quad-reads its compare\n{before}");
+    }
+}
+
+/// The pixel shader of the two tests above, translated: after `s_wqm`, a mask read by
+/// `v_cndmask` (A), one for `s_and_saveexec` (B) and a waterfall loop over `v_readfirstlane` of
+/// pos.x (C); exports |ddx| of A, |ddy| of B, C's iteration count and 1.
+fn helper_lane_masks_ps(wave64: bool) -> super::Translation {
+    use super::PsInterface;
+    {
+        // the wave-size forms of the scalar mask instructions; EXEC / VCC = their low words in wave32
+        let (mov, wqm, and_save, xor) = if wave64 {
+            ("S_MOV_B64", "S_WQM_B64", "S_AND_SAVEEXEC_B64", "S_XOR_B64")
+        } else {
+            ("S_MOV_B32", "S_WQM_B32", "S_AND_SAVEEXEC_B32", "S_XOR_B32")
+        };
+        let sop1 = |n: &'static str, d: u64, s: u64| (n, "ENC_SOP1", vec![("SDST", d), ("SSRC0", s)], None);
+        type I = (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>);
+        let head: Vec<I> = vec![
+            sop1(mov, 20, 126), // s[20:21] = the live lanes
+            sop1(wqm, 126, 126),
+            // A: v4 = v_cndmask(0, pos.x, 0 < pos.x) – pos.x in every lane; v6 = v4 of the quad's
+            // other column (quad_perm [1,0,3,2]) - v4
+            ("V_CMP_LT_F32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 2)], None),
+            ("V_CNDMASK_B32", "ENC_VOP2", vec![("VDST", 4), ("SRC0", 128), ("VSRC1", 2)], None),
+            ("V_MOV_B32", "VOP1_VOP_DPP16", vec![("VDST", 5), ("SRC0", 0xFA), ("VSRC0", 4), ("DPP_CTRL", 0xB1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+            ("V_SUB_F32", "ENC_VOP2", vec![("VDST", 6), ("SRC0", V + 5), ("VSRC1", 4)], None),
+            // B: v7 = pos.y under s_and_saveexec(0 < pos.y); v9 = v7 of the quad's other row
+            // (quad_perm [2,3,0,1]) - v7
+            ("V_CMP_LT_F32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 3)], None),
+            sop1(and_save, 22, 106),
+            ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 7), ("SRC0", V + 3)], None),
+            sop1(mov, 126, 22),
+            ("V_MOV_B32", "VOP1_VOP_DPP16", vec![("VDST", 8), ("SRC0", 0xFA), ("VSRC0", 7), ("DPP_CTRL", 0x4E), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+            ("V_SUB_F32", "ENC_VOP2", vec![("VDST", 9), ("SRC0", V + 8), ("VSRC1", 7)], None),
+            // C: a waterfall loop over pos.x, s8 = its iterations
+            ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 8), ("SSRC0", 128)], None),
+            sop1(mov, 24, 126),
+        ];
+        let body: Vec<I> = vec![
+            ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 4), ("SRC0", V + 2)], None),
+            ("V_CMP_EQ_F32", "ENC_VOPC", vec![("SRC0", 4), ("VSRC1", 2)], None),
+            sop1(and_save, 26, 106),
+            ("S_ADD_U32", "ENC_SOP2", vec![("SDST", 8), ("SSRC0", 8), ("SSRC1", 129)], None),
+            (xor, "ENC_SOP2", vec![("SDST", 126), ("SSRC0", 26), ("SSRC1", 126)], None),
+        ];
+        let tail: Vec<I> = vec![
+            sop1(mov, 126, 24),
+            ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 10), ("SRC0", 8)], None),
+            ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 11), ("SRC0", 242)], None),
+            sop1(mov, 126, 20), // back to the live lanes for the export
+            ("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 0xF), ("VSRC0", 6), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11), ("DONE", 1), ("VM", 1)], None),
+        ];
+        let enc = |l: &[I]| -> Vec<u8> { l.iter().flat_map(|(n, e, f, x)| encode(n, e, f, *x).unwrap_or_else(|err| panic!("{n}: {err}"))).collect() };
+        let body_code = enc(&body);
+        let back = (-((body_code.len() as i64 + 4) / 4)) as u16 as u64;
+        let mut ps_code = enc(&head);
+        ps_code.extend(&body_code);
+        ps_code.extend(encode("S_CBRANCH_EXECNZ", "ENC_SOPP", &[("SIMM16", back)], None).unwrap());
+        ps_code.extend(enc(&tail));
+        ps_code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None };
+        translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64, ..Default::default() }).unwrap()
+    }
+}
+
+/// What the pixel shaders' masks (`ballot_px`) and lane reads (`rla`) rely on, checked on the
+/// adapter with native HLSL on the same two triangles: a quad is hardware lanes 4k..4k+3 (X = ^1,
+/// Y = ^2, diagonal = ^3), and a helper lane gets the wave's result of a `WaveActiveBallot` –
+/// each lane holds its own copy of EXEC, a helper lane's included. Not every wave op does that:
+/// `WaveActiveBitOr` gave helper lanes another value on an RTX 5070 Ti (printed, not checked).
+#[test]
+fn gpu_ps_helper_lanes_see_ballots_and_quads_are_lanes_4k() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+    let vs = super::dxc::compile("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0.5, 1.0); }\n", "main", "vs_6_6", &[]).unwrap();
+    // per pixel: is the quad's other column a helper lane; does it see this lane's ballot and
+    // bit-or; are this lane and that one at lanes 4k..4k+3
+    let src = "float4 main(float4 p : SV_Position) : SV_Target {\n\
+        uint l = WaveGetLaneIndex();\n\
+        uint hl = IsHelperLane() ? 1u : 0u;\n\
+        uint b = WaveActiveBallot(((uint)p.x & 3u) == 1u).x;\n\
+        uint o = WaveActiveBitOr(1u << (l & 31u));\n\
+        bool lay = QuadReadAcrossX(l) == (l ^ 1u) && QuadReadAcrossY(l) == (l ^ 2u) && QuadReadAcrossDiagonal(l) == (l ^ 3u) && QuadReadLaneAt(l, 0u) == (l & ~3u);\n\
+        bool both = lay && QuadReadAcrossX((uint)lay) != 0u;\n\
+        return float4(QuadReadAcrossX(hl), QuadReadAcrossX(b) == b ? 1.0 : 0.0, QuadReadAcrossX(o) == o ? 1.0 : 0.0, both ? 1.0 : 0.0);\n}\n";
+    let ps = super::dxc::compile(src, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    let quad = [-1.0f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
+    let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+    let px = runner::draw(&vs, &ps, &layout, &quad, 8, &[], &[], 32, [9.0; 4]).unwrap();
+    let helpers: Vec<[f32; 4]> = px.iter().copied().filter(|p| p[0] == 1.0).collect();
+    let ballot = helpers.iter().filter(|p| p[1] == 1.0).count();
+    let bit_or = helpers.iter().filter(|p| p[2] == 1.0).count();
+    let quads = px.iter().filter(|p| p[3] == 1.0).count();
+    println!("{:?}: {} pixels next to a helper lane; its ballot right in {ballot}, its bit-or in {bit_or}; quads at lanes 4k in {quads} of {}", runner::adapter(), helpers.len(), px.len());
+    assert!(!helpers.is_empty(), "no helper lanes along the diagonal");
+    assert_eq!(ballot, helpers.len(), "helper lanes without the wave's ballot");
+    assert_eq!(quads, px.len(), "quads not at hardware lanes 4k..4k+3");
+}
+
 /// XCL image descriptor (T#, GFX10 layout): BASE_ADDRESS = SRV heap index, FORMAT, TYPE.
 fn tsharp(index: u32, format: u32, ty: u32) -> [u32; 8] {
     [index, format << 20, 0, ty << 28, 0, 0, 0, 0]
@@ -2357,6 +2517,41 @@ fn gpu_cube_array_slices() {
         let fl = |i: usize| f32::from_bits(v[i]);
         assert_eq!([fl(10), fl(11), fl(12), fl(13)], [face, cube, 6.0 * cube + face, 1.0], "lane {l}: cube {cube} face {face}");
         assert_eq!(&v[20..24], &[2, 2, 12, 1], "lane {l} resinfo (w, h, layers, mips)");
+    }
+}
+
+/// image_get_resinfo on a 1D array (DIM 4) gives the layers in y, as RDNA does (GFX9, which
+/// binds 1D arrays as 2D arrays, gives them in z and Mesa moves them to y there only).
+#[test]
+fn image_get_resinfo_1d_array_layers_in_y() {
+    let code = prog(&[("IMAGE_GET_RESINFO", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 4)], None)]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.hlsl.contains("Texture1DArray<float4>"), "{}", t.hlsl);
+    let call = t.hlsl.split("_T.GetDimensions(").nth(1).and_then(|s| s.split(')').next()).unwrap_or_else(|| panic!("{}", t.hlsl));
+    let args: Vec<&str> = call.split(", ").collect();
+    assert!(args.len() == 4 && args[2].ends_with("_h"), "GetDimensions({call}) must write the elements into _h\n{}", t.hlsl);
+}
+
+/// A 4-wide 1D array of 3 layers: image_get_resinfo gives (width, layers, _, mips).
+#[test]
+fn gpu_image_get_resinfo_1d_array() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let mut code = encode("IMAGE_GET_RESINFO", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 4)], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 12));
+    for r in st.vgpr.iter_mut() {
+        r[3] = 0; // mip
+    }
+    let tex = [TestTexture { dim: TexDim::D1Array, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 1, depth: 3, texel_bytes: 16, data: vec![0; 4 * 3 * 16], uav: false }];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        assert_eq!([v[20], v[21], v[23]], [4, 3, 1], "lane {l} resinfo (w, layers, mips)");
     }
 }
 
@@ -2953,6 +3148,107 @@ fn gpu_mesh_mode_two_passes() {
     let ps16 = dxc::compile(&format!("struct V {{ float4 pos : SV_Position;{fields} }};\nfloat4 main(V v) : SV_Target0 {{ return v.t0 + v.t15; }}\n"), "main", "ps_6_6", &[]).unwrap();
     let (px16, _) = runner::mesh_draw_split(&cs, &msb16, &ps16, 2, split, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
     assert!(px16 == px, "split pass-through draws the same pixels");
+}
+
+/// The mesh output budget with wide vertices: DXC accounts whole chunks of 32 vertices even
+/// when fewer are declared, so 78 vertices with 22 float4 rows are accounted as 96 (33792 B >
+/// 32768) and the record must go out in split groups. A retail title's NGG transform programs
+/// have this shape (128 vertices / 128 primitives, 21 params + SV_ClipDistance0); the previous
+/// budget (32768 / stride) emitted verts[78] and DXC refused every one of them.
+#[test]
+fn mesh_split_accounts_vertex_chunks() {
+    use super::emit::{mesh_passthrough, passthrough_elements, passthrough_split};
+    use super::MsInterface;
+    if super::dxc::location().is_err() {
+        println!("no DXC – skipping");
+        runner::skip_test("no DXC");
+        return;
+    }
+    let sig = |name: &str, sv: u32, reg: u32, index: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let mut outputs = vec![sig("SV_Position", 1, 0, 0)];
+    for k in 0..20u32 {
+        outputs.push(sig("TEXCOORD", 0, k + 1, k));
+    }
+    outputs.push(sig("SV_ClipDistance", 2, 21, 0));
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 128, max_primitives: 128 };
+    let elems = passthrough_elements(&ms, None);
+    assert_eq!(elems, 21);
+    // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit (96 would be 33792 B), so at
+    // most 21 triangles' worth of copies per group, ceil(128/21) = 7 groups of 19
+    let split = passthrough_split(&ms, elems);
+    assert_eq!(split, 7, "chunks of 32: 78 verts are accounted as 96 and refused");
+    let pass = mesh_passthrough(&ms);
+    assert!(pass.contains("verts[57]"), "19 triangles per group:\n{pass}");
+    super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    // 20 rows * 16 B = 320 B/vertex: 96 accounted vertices fit (30720 B), but a whole record
+    // is 128 vertices (40960 B) – 4 groups of 32 triangles, 96 vertices each
+    let mut ms20 = ms.clone();
+    ms20.outputs.pop();
+    assert_eq!(passthrough_split(&ms20, passthrough_elements(&ms20, None)), 4);
+    let pass20 = mesh_passthrough(&ms20);
+    assert!(pass20.contains("verts[96]"), "96 vertices per group:\n{pass20}");
+    super::dxc::compile(&pass20, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass20}"));
+    // 8 rows * 16 B = 128 B/vertex: 128 vertices are 16384 B – the record stays whole
+    let mut ms8 = ms.clone();
+    ms8.outputs.truncate(8);
+    assert_eq!(passthrough_split(&ms8, passthrough_elements(&ms8, None)), 1);
+    let pass8 = mesh_passthrough(&ms8);
+    assert!(pass8.contains("verts[128]"), "whole record:\n{pass8}");
+    super::dxc::compile(&pass8, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass8}"));
+}
+
+/// The layout and the dispatch count are chosen separately: a record of 80 vertices with 22
+/// float4 rows does not fit the mesh output budget as a whole (DXC accounts 96 vertices:
+/// 33792 B > 32768 B), but its single triangle's copies fit one compact group. The pass-
+/// through must then declare the compact layout while `passthrough_split` returns 1, and DXC
+/// accepts it (the whole-record declaration is refused).
+#[test]
+fn mesh_layout_independent_of_group_count() {
+    use super::emit::{mesh_passthrough, passthrough_elements, passthrough_split};
+    use super::MsInterface;
+    if super::dxc::location().is_err() {
+        println!("no DXC – skipping");
+        runner::skip_test("no DXC");
+        return;
+    }
+    let sig = |name: &str, sv: u32, reg: u32, index: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let mut outputs = vec![sig("SV_Position", 1, 0, 0)];
+    for k in 0..20u32 {
+        outputs.push(sig("TEXCOORD", 0, k + 1, k));
+    }
+    outputs.push(sig("SV_ClipDistance", 2, 21, 0));
+    // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit; 80 declared do not
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 80, max_primitives: 1 };
+    let elems = passthrough_elements(&ms, None);
+    assert_eq!(elems, 21);
+    // one triangle: its 3 copies fit one compact group, so the dispatch count is 1
+    assert_eq!(passthrough_split(&ms, elems), 1, "one triangle fits one compact group");
+    let pass = mesh_passthrough(&ms);
+    assert!(pass.contains("verts[3]"), "the compact layout is chosen, not verts[80]:\n{pass}");
+    super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    // the whole-record form is what DXC refuses at this width: the same record declared whole
+    // (verts[80], accounted as 96: 33792 B) does not validate
+    let whole = pass.replace("verts[3]", "verts[80]");
+    assert!(whole.contains("verts[80]"), "the whole-record declaration for the refusal check:\n{whole}");
+    assert!(super::dxc::compile(&whole, "main", "ms_6_6", &[]).is_err(), "DXC refuses 96 accounted vertices of 352 B");
 }
 
 /// DXC optimisation levels on a saved HLSL file (`XCL_TIME_HLSL=path`, profile in `XCL_TIME_PROFILE`).
@@ -6748,6 +7044,18 @@ fn float_compares_random(wave64: bool) {
     assert_eq!(total_bad, 0);
 }
 
+/// image_gather4h(_pck) / image_gather8h_pck read a row of texels: not translated as a 2x2 Gather.
+#[test]
+fn image_gather4h_is_unsupported() {
+    for name in ["IMAGE_GATHER4H", "IMAGE_GATHER4H_PCK", "IMAGE_GATHER8H_PCK"] {
+        let code = prog(&[(name, "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None)]);
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(!t.complete(), "{name}\n{}", t.hlsl);
+        let key = format!("{}: image_gather4h", name.to_ascii_lowercase());
+        assert!(t.unsupported_why.contains_key(&key), "{name}: {:?}", t.unsupported_why);
+    }
+}
+
 fn hwreg_imm(id: u64, offset: u64, width: u64) -> u64 {
     id | (offset << 6) | ((width - 1) << 11)
 }
@@ -7313,6 +7621,43 @@ fn gpu_pknorm_i16_f32_nan_and_fmt_encode_snorm_ufloat() {
     assert_eq!(r.mem[0x208 / 4], 0x1E0 << 22, "10_11_11_FLOAT (-1, -inf, 1)");
     // 16_16_SNORM (NaN, -1.0): lo=0, hi=-32767 (0x8001)
     assert_eq!(r.mem[0x20C / 4], 0x8001_0000, "16_16_SNORM (NaN, -1.0)");
+}
+
+#[test]
+fn gpu_fmt_encode_int_sat_and_f16_rtz() {
+    if !gpu_ready() {
+        return;
+    }
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let vs = |base: u32, fmt: u32| [base, 0, 0x100, ident | fmt << 12];
+    let p = prog(&[
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 0), ("SRSRC", 4), ("SOFFSET", 128)], None),  // 16_16_UINT
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 2), ("SRSRC", 5), ("SOFFSET", 128)], None),  // 16_16_SINT
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 4), ("SRSRC", 6), ("SOFFSET", 128)], None),  // 16_16_FLOAT
+        ("BUFFER_STORE_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 6), ("SRSRC", 7), ("SOFFSET", 128)], None), // 11_11_10_FLOAT
+    ]);
+    let mut st = KernelState::default();
+    st.sgpr[16..20].copy_from_slice(&vs(0x200, 27));
+    st.sgpr[20..24].copy_from_slice(&vs(0x204, 28));
+    st.sgpr[24..28].copy_from_slice(&vs(0x208, 29));
+    st.sgpr[28..32].copy_from_slice(&vs(0x20C, 43));
+    for r in st.vgpr.iter_mut() {
+        r[0] = 70_000u32;
+        r[1] = 65_535u32;
+        r[2] = 40_000i32 as u32;
+        r[3] = (-40_000i32) as u32;
+        r[4] = 65520.0f32.to_bits();
+        r[5] = (-65520.0f32).to_bits();
+        r[6] = 65520.0f32.to_bits();
+        r[7] = f32::INFINITY.to_bits();
+        r[8] = 65520.0f32.to_bits();
+    }
+    let mem = vec![0u32; 0x100];
+    let r = runner::run_code(&p, &st, &mem).unwrap();
+    assert_eq!(r.mem[0x200 / 4], 0xFFFF_FFFF, "16_16_UINT saturates 70000 -> 65535");
+    assert_eq!(r.mem[0x204 / 4], 0x8000_7FFF, "16_16_SINT saturates (40000, -40000)");
+    assert_eq!(r.mem[0x208 / 4], 0xFBFF_7BFF, "16_16_FLOAT saturates finite overflow to max finite");
+    assert_eq!(r.mem[0x20C / 4], 0x3DF | (0x7C0 << 10) | (0x7BF << 21), "11_11_10_FLOAT saturates finite overflow and keeps +inf");
 }
 
 #[test]

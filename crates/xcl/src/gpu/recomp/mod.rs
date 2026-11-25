@@ -51,6 +51,7 @@
 //! Memory instructions use a flat model: descriptor/base addresses index one
 //! `ByteAddressBuffer` (`mem`); initial SGPRs (user data) come from `io`. Textures come next.
 
+pub mod cfg;
 pub mod dxc;
 pub mod dxil;
 pub mod lane_masks;
@@ -60,6 +61,7 @@ pub(crate) mod emit;
 pub(crate) mod opt;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
+pub mod partition;
 pub mod x64_masks;
 pub mod pso;
 pub use emit::mesh_passthrough;
@@ -1484,9 +1486,12 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     em.program_opt = opt::analyze(&insts, &leaders_vec, opt);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
-    // continues from the ES into the GS through s_setpc: left as it is)
+    // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
+    // skip the quad reads that give the helper lanes' bits
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-        em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+        em.mask_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+    } else if matches!(opt.mode, Mode::Pixel(_)) {
+        em.mask_whole_live = x64_masks::by_pc(&insts, false);
     }
     // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the
     // program reads them (the driver may still pick 64 lanes: decided at run time); only a

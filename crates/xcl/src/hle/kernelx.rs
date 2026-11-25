@@ -58,6 +58,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XMemFreePhysicalPages,
         XMemTransferMemory,
         XMemGetWorkingSetStatistics,
+        XMemIsToolsMemAvailable,
         TitleMemoryStatus,
         JobTitleMemoryStatus,
         ToolingMemoryStatus,
@@ -833,6 +834,12 @@ pub unsafe extern "system" fn ToolingMemoryStatus(buf: *mut u32) -> BOOL {
     }
     std::ptr::write_bytes((buf as *mut u8).add(8), 0, 32);
     1
+}
+
+/// `BOOL XMemIsToolsMemAvailable()`: whether tooling (debug) memory is available on the console.
+/// Returns FALSE (0) in retail title execution.
+pub unsafe extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
+    0
 }
 
 /// Title physical pages (64 KiB) emulated in the unified memory region: an allocation is one
@@ -2757,6 +2764,11 @@ mod tests {
         assert!(process_private_bytes() > 0 && s.avail < s.total);
         s.dw_length = 8;
         assert_eq!(unsafe { TitleMemoryStatus(&mut s) }, 0);
+    }
+
+    #[test]
+    fn xmem_is_tools_mem_available_returns_false() {
+        assert_eq!(unsafe { XMemIsToolsMemAvailable() }, 0);
     }
 
     #[test]
