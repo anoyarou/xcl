@@ -3953,7 +3953,7 @@ fn pso_trace() -> bool {
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let slot = huge.then(|| big_compile_turn(compile_slots(bytes), big_compile_commit_free, super::pso_async::build_is_wanted)).flatten();
+    let slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)).flatten();
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3990,11 +3990,11 @@ fn gate_compute_driver_compile(has_cached_blob: bool) -> bool {
 }
 
 /// Before a big driver compile in the background: its turn – unwanted builds wait for `slots.most()`
-/// and 3 GB of commit free (each takes ~0.5–1.5 GB; the title loading next to it must not run out).
-/// When a title thread waits for the pipeline (`wanted`), it bypasses the 3 GB commit wait and can
-/// use up to `slots.wanted_most()` (default 2 for `>= 256 KB`, 1 for `>= 4 MiB` giant shaders) so a
-/// wanted build is not stuck behind 1 background build while a burst of 10+ lazy binds still cannot
-/// spike driver compiler commit into OOM.
+/// and the commit headroom it asks for (`commit_free`, from `big_compile_headroom`; the title
+/// loading next to it must not run out). When a title thread waits for the pipeline (`wanted`), it
+/// bypasses the commit wait and can use up to `slots.wanted_most()` (default 2 for `>= 256 KB`, 1
+/// for `>= 4 MiB` giant shaders) so a wanted build is not stuck behind 1 background build while a
+/// burst of 10+ lazy binds still cannot spike driver compiler commit into OOM.
 fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> Option<SlotGuard> {
     const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
     let slot = {
@@ -4018,12 +4018,21 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
     Some(slot)
 }
 
-/// 3 GB of commit are free (true when that is not known).
-fn big_compile_commit_free() -> bool {
+/// Commit headroom a big driver compile waits for: 3 GB for the class that starts at
+/// `huge_pso_bytes()` (each takes ~1.5 GB in the driver), and ~512× the DXIL size above 6 MiB
+/// of it — the driver's compile of a 29.8 MB program grew past 14 GB free before it was stopped
+/// (#1269), and programs of ~1 MB took several GB each on an 8 GB card (same issue). The floor
+/// leaves every program up to 6 MiB of DXIL waiting for exactly what it waited for before.
+fn big_compile_headroom(dxil_len: usize) -> u64 {
+    (3u64 << 30).max(dxil_len as u64 * 512)
+}
+
+/// That much commit is free (true when that is not known).
+fn big_compile_commit_free(need: u64) -> bool {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= 3 << 30 }
+    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= need }
 }
 
 #[cfg(test)]
@@ -4163,6 +4172,17 @@ mod big_compile_tests {
     }
 
     #[test]
+    fn headroom_is_the_3_gb_floor_until_512_times_the_dxil_exceeds_it() {
+        // the class from huge_pso_bytes() up to 6 MiB of DXIL: the floor, unchanged
+        assert_eq!(big_compile_headroom(huge_pso_bytes()), 3 << 30);
+        assert_eq!(big_compile_headroom(6 << 20), 3 << 30);
+        // above it the wait scales with the program: the 29.8 MB one that grew past 14 GB of
+        // free commit (#1269) waits for 15 GB
+        assert_eq!(big_compile_headroom(8 << 20), 4 << 30);
+        assert_eq!(big_compile_headroom(29_800_000), 29_800_000u64 * 512);
+    }
+
+    #[test]
     fn unwanted_builds_go_one_at_a_time_when_the_commit_is_there() {
         static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2 };
         let first = big_compile_turn(&S, || true, || false).expect("its turn");
@@ -4231,7 +4251,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
-    // in the background, a few at a time and within the commit left (each ~1.5 GB in the driver)
+    // in the background, a few at a time and within the commit headroom the program asks for
     let record = crate::gpu::shader::fnv64(cs);
     let (mut hr, mut in_driver) = driver_compile_identified(
         "compute",
@@ -5506,7 +5526,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let bytes = stream.shader_bytes() + tp.cs.len();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), big_compile_commit_free, super::pso_async::build_is_wanted)).flatten();
+    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)).flatten();
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated: {}, waited {} ms", _slot.is_some(), waited.elapsed().as_millis());
     }
