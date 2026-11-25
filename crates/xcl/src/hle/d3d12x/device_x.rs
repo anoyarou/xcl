@@ -1373,8 +1373,14 @@ mod tests {
             103, 107,      // YUV (NV12, YUY2)
         ] {
             let (out_fmt, out_flags) = make(3, fmt, 1, 0x4);
-            assert_eq!(out_fmt, fmt, "format {fmt} kept");
-            assert_eq!(out_flags & 0x4, 0, "format {fmt} must strip ALLOW_UNORDERED_ACCESS");
+            if matches!((fmt, out_fmt), (85, 28) | (88, 87)) {
+                // promoted to a format a PC driver takes as a UAV of the same values: the flag
+                // stays, and is valid there
+                assert_eq!(out_flags & 0x4, 0x4, "format {fmt} promoted to {out_fmt} keeps ALLOW_UNORDERED_ACCESS");
+            } else {
+                assert_eq!(out_fmt, fmt, "format {fmt} kept");
+                assert_eq!(out_flags & 0x4, 0, "format {fmt} must strip ALLOW_UNORDERED_ACCESS");
+            }
         }
         // Multisampled textures never support UAV even on UAV-capable formats:
         assert_eq!(make(3, 28, 4, 0x5), (28, 0x1));
