@@ -107,7 +107,8 @@ fn page_descriptors(n: u32, p: u32) -> u32 {
     2 * n.saturating_sub(p * PAGE_SLOTS).clamp(1, PAGE_SLOTS)
 }
 
-/// A first-fit range of `count` in `free` (released ranges), else at `next` below `cap`.
+/// A first-fit range of `count` in `free` (released ranges), else at `next` below `cap`. A freed
+/// range ending at the cursor is contiguous with the tail: take it and bump over into the tail.
 fn take_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32) -> Option<u32> {
     if let Some(i) = free.iter().position(|&(_, n)| n >= count) {
         let (f, n) = free[i];
@@ -116,6 +117,13 @@ fn take_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32) 
         } else {
             free[i] = (f + count, n - count);
         }
+        return Some(f);
+    }
+    // no single freed range is big enough: one ending at the cursor continues into the tail
+    if let Some(i) = free.iter().position(|&(f, n)| f + n == *next && (n as u64 + (cap - *next) as u64) >= count as u64) {
+        let (f, n) = free[i];
+        free.swap_remove(i);
+        *next += count - n;
         return Some(f);
     }
     if cap - *next < count {
@@ -237,9 +245,27 @@ fn page_of(h: &mut Heap, k: u32) -> Option<(u32, u32)> {
 
 /// The shared range starting at `first` (`count` descriptors) is free again.
 pub fn release_global(first: u32, count: u32) {
-    if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
-        s.free.push((first, count));
+    if count == 0 {
+        return;
     }
+    if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
+        merge_release(&mut s.free, first, count);
+    }
+}
+
+/// Add a released range to `free`, merging the ranges it touches: adjacent releases become
+/// one range, so first-fit (and the cursor-straddle in `take_range`) sees the whole run.
+fn merge_release(free: &mut Vec<(u32, u32)>, first: u32, count: u32) {
+    free.push((first, count));
+    free.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(free.len());
+    for (f, n) in free.drain(..) {
+        match out.last_mut() {
+            Some(last) if f <= last.0 + last.1 => last.1 = last.1.max(f + n - last.0),
+            _ => out.push((f, n)),
+        }
+    }
+    *free = out;
 }
 
 /// The shader-visible PC heap lists bind for view descriptors (None: none shared).
@@ -543,6 +569,27 @@ mod tests {
         assert_eq!(take_range(&mut free, &mut next, 100, 20), Some(80));
         assert_eq!(take_range(&mut free, &mut next, 100, 10), Some(30));
         assert!(free.is_empty());
+    }
+
+    #[test]
+    fn a_freed_range_at_the_cursor_continues_into_the_never_used_tail() {
+        // the false-full shape: four freed slots end at the cursor and four more were never
+        // used; a request for eight is contiguous across the cursor, not exhaustion
+        let (mut free, mut next) = (vec![(8u32, 4u32)], 12u32);
+        assert_eq!(take_range(&mut free, &mut next, 16, 8), Some(8), "freed range plus tail is one run");
+        assert_eq!(next, 16);
+        assert!(free.is_empty());
+    }
+
+    #[test]
+    fn released_ranges_touching_one_another_merge_into_one() {
+        let mut free = vec![(0u32, 4), (16, 4)];
+        merge_release(&mut free, 4, 8);
+        assert_eq!(free, vec![(0, 12), (16, 4)]);
+        merge_release(&mut free, 12, 4);
+        assert_eq!(free, vec![(0, 20)], "the merge chains across the whole run");
+        merge_release(&mut free, 30, 2);
+        assert_eq!(free, vec![(0, 20), (30, 2)]);
     }
 
     #[test]
