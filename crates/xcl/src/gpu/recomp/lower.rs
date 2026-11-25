@@ -426,6 +426,7 @@ impl<'a, I: Ir> Lower<'a, I> {
         }
         Ok(match code {
             0..=105 | 106 | 107 | 124 | 126 | 127 => self.read_num(b, code as u8)?,
+            125 => self.ir.int(0),
             128..=192 => self.ir.int((code - 128) as u32),
             193..=208 => self.ir.int((-((code - 192) as i32)) as u32),
             240..=247 => self.ir.int([0.5f32, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0][(code - 240) as usize].to_bits()),
@@ -440,12 +441,34 @@ impl<'a, I: Ir> Lower<'a, I> {
         })
     }
 
-    /// A scalar source operand as a mask's lane bit: a register, all lanes or none.
-    fn src_bit(&mut self, b: usize, code: u64) -> R<I::V> {
+    /// A scalar source operand as a mask's lane bit: a register, NULL, inline integer, or literal.
+    fn src_bit(&mut self, b: usize, d: &Decoded, code: u64) -> R<I::V> {
+        let bit_of_const = |this: &mut Self, lo: u32, hi_all_ones: bool| {
+            let lane = this.lane();
+            let c31 = this.ir.int(31);
+            let sh = this.ir.bin(Bin::And, lane, c31);
+            let clo = this.ir.int(lo);
+            let shifted = this.ir.bin(Bin::LShr, clo, sh);
+            let one = this.ir.int(1);
+            let masked = this.ir.bin(Bin::And, shifted, one);
+            let z = this.ir.int(0);
+            let lo_bit = this.ir.icmp(Cmp::Ne, masked, z);
+            if this.wave64 {
+                let c32 = this.ir.int(32);
+                let upper = this.ir.icmp(Cmp::Uge, lane, c32);
+                let hi_bit = this.ir.boolean(hi_all_ones);
+                this.ir.select(upper, hi_bit, lo_bit)
+            } else {
+                lo_bit
+            }
+        };
         match code {
             0..=105 | 106 | 107 | 126 | 127 => self.read_bit(b, code as u8),
-            128 => Ok(self.ir.boolean(false)),
+            125 | 128 => Ok(self.ir.boolean(false)),
             193 => Ok(self.ir.boolean(true)),
+            129..=192 => Ok(bit_of_const(self, (code - 128) as u32, false)),
+            194..=208 => Ok(bit_of_const(self, (-((code - 192) as i32)) as u32, true)),
+            255 => Ok(bit_of_const(self, d.literal.ok_or("missing literal")?, false)),
             _ => Err(format!("mask source code {code}")),
         }
     }
@@ -545,7 +568,7 @@ impl<'a, I: Ir> Lower<'a, I> {
             let reads_mask = srcs.iter().any(|&c| c <= 127 && c != 124 && self.holds_mask(b, c as u8));
             let bitwise = matches!(op, "MOV" | "NOT" | "AND" | "OR" | "XOR" | "ANDN2" | "ORN2" | "NAND" | "NOR" | "XNOR");
             if let Some(op) = saveexec {
-                let a = self.src_bit(b, s0)?;
+                let a = self.src_bit(b, d, s0)?;
                 let old = self.read_bit(b, EXEC)?;
                 let new = self.bit_op(op, a, old)?;
                 self.write_bit(b, EXEC, new);
@@ -557,19 +580,19 @@ impl<'a, I: Ir> Lower<'a, I> {
             }
             if op == "CSELECT" && (sd == EXEC || reads_mask) {
                 // `s_cselect_b64 s, exec, 0`: the lane's bit of the source SCC picks
-                let (a, c) = (self.src_bit(b, s0)?, self.src_bit(b, s1)?);
+                let (a, c) = (self.src_bit(b, d, s0)?, self.src_bit(b, d, s1)?);
                 let scc = self.read_scc(b);
                 let v = self.ir.select(scc, a, c);
                 self.write_bit(b, sd, v);
                 return Ok(());
             }
             if bitwise && (sd == EXEC || reads_mask) {
-                let a = self.src_bit(b, s0)?;
+                let a = self.src_bit(b, d, s0)?;
                 let v = match op {
                     "MOV" => a,
                     "NOT" => self.not(a),
                     _ => {
-                        let c = self.src_bit(b, s1)?;
+                        let c = self.src_bit(b, d, s1)?;
                         self.bit_op(op, a, c)?
                     }
                 };
@@ -583,7 +606,7 @@ impl<'a, I: Ir> Lower<'a, I> {
         // mask compares (`s_cmp_lg_u64 exec, 0`): whether the lane's bits differ / agree
         let cmp64 = if self.wave64 { ["S_CMP_EQ_U64", "S_CMP_LG_U64"] } else { ["S_CMP_EQ_U32", "S_CMP_LG_U32"] };
         if cmp64.contains(&name) && [s0, s1].iter().any(|&c| c <= 127 && self.holds_mask(b, c as u8)) {
-            let (a, c) = (self.src_bit(b, s0)?, self.src_bit(b, s1)?);
+            let (a, c) = (self.src_bit(b, d, s0)?, self.src_bit(b, d, s1)?);
             let x = self.ir.bin(Bin::Xor, a, c);
             let v = if name == cmp64[0] { self.not(x) } else { x };
             self.write_scc(b, v);
@@ -728,6 +751,7 @@ impl<'a, I: Ir> Lower<'a, I> {
     fn src64(&mut self, b: usize, d: &Decoded, code: u64) -> R<(I::V, I::V)> {
         Ok(match code {
             0..=105 | 106 | 126 => (self.read_num(b, code as u8)?, self.read_num(b, code as u8 + 1)?),
+            125 => (self.ir.int(0), self.ir.int(0)),
             128..=192 => (self.ir.int((code - 128) as u32), self.ir.int(0)),
             193..=208 => (self.ir.int((-((code - 192) as i32)) as u32), self.ir.int(u32::MAX)),
             255 => (self.ir.int(d.literal.ok_or("missing literal")?), self.ir.int(0)),
@@ -798,7 +822,7 @@ impl<'a, I: Ir> Lower<'a, I> {
             "V_MOV_B32" => self.src(b, d, s0)?,
             "V_CNDMASK_B32" => {
                 let sel = if vop3 { fv("SRC2").unwrap_or(0) } else { VCC as u64 };
-                let m = self.src_bit(b, sel)?;
+                let m = self.src_bit(b, d, sel)?;
                 let (a, c) = (self.src(b, d, s0)?, self.src(b, d, s1)?);
                 self.ir.select(m, c, a)
             }
@@ -1593,26 +1617,25 @@ impl<I: Ir> Lower<'_, I> {
             None
         };
         if let Some(m) = lane_mask {
-            if m > 127 {
-                return Err(format!("{name}: mask operand {m}"));
-            }
-            let bit = self.src_bit(b, m)?;
-            let lane = self.lane();
-            let one = self.ir.zext(bit);
-            let c31 = self.ir.int(31);
-            let sh = self.ir.bin(Bin::And, lane, c31);
-            let own = self.ir.bin(Bin::Shl, one, sh);
-            if self.wave64 {
-                let (c32, z) = (self.ir.int(32), self.ir.int(0));
-                let upper = self.ir.icmp(Cmp::Uge, lane, c32);
-                let (lo, hi) = (self.ir.select(upper, z, own), self.ir.select(upper, own, z));
-                inputs.push((Var::S(m as u8), lo));
-                inputs.push((Var::S(m as u8 + 1), hi));
-            } else {
-                // #1426 reads the mask as an SGPR pair in wave32 too: the upper one is 0
-                let z = self.ir.int(0);
-                inputs.push((Var::S(m as u8), own));
-                inputs.push((Var::S(m as u8 + 1), z));
+            if m <= 127 && m != 125 {
+                let bit = self.src_bit(b, d, m)?;
+                let lane = self.lane();
+                let one = self.ir.zext(bit);
+                let c31 = self.ir.int(31);
+                let sh = self.ir.bin(Bin::And, lane, c31);
+                let own = self.ir.bin(Bin::Shl, one, sh);
+                if self.wave64 {
+                    let (c32, z) = (self.ir.int(32), self.ir.int(0));
+                    let upper = self.ir.icmp(Cmp::Uge, lane, c32);
+                    let (lo, hi) = (self.ir.select(upper, z, own), self.ir.select(upper, own, z));
+                    inputs.push((Var::S(m as u8), lo));
+                    inputs.push((Var::S(m as u8 + 1), hi));
+                } else {
+                    // #1426 reads the mask as an SGPR pair in wave32 too: the upper one is 0
+                    let z = self.ir.int(0);
+                    inputs.push((Var::S(m as u8), own));
+                    inputs.push((Var::S(m as u8 + 1), z));
+                }
             }
         }
         if operand(true, "OPR_SSRC_SPECIAL_SCC") {
